@@ -4052,32 +4052,66 @@ async function streamAgentText(messages, tierKey, signal, onDelta) {
   return out;
 }
 
-/** System prompt for resuming a cut-off code file: output ONLY the missing tail. */
+/** Heuristic: does this code already look like a COMPLETE file (so Continue no-ops)? */
+function codeLooksComplete(code, lang) {
+  const s = String(code || "").replace(/\s+$/, "");
+  if (!s) return false;
+  const isHtml = lang === "html" || /<!doctype html|<html[\s>]/i.test(s);
+  if (isHtml) return /<\/html>\s*$/i.test(s);
+  const opens = (s.match(/\{/g) || []).length, closes = (s.match(/\}/g) || []).length;
+  return opens === closes && /[}\);\]>]\s*$/.test(s);
+}
+/** Remove firas-code wrappers / stray meta objects the model sometimes leaks INTO a
+    code body (they corrupt the file). */
+function cleanCodeBody(s) {
+  let t = String(s == null ? "" : s);
+  t = t.replace(/```firas-code[ \t]+\{[\s\S]*?\}[ \t]*\r?\n?/g, "");
+  t = t.replace(/\{"filename":\s*"[^"]*"\s*,\s*"lang":\s*"[^"]*"\s*,\s*"ext":\s*"[^"]*"\s*,\s*"label":\s*"[^"]*"\}/g, "");
+  return t;
+}
+/** Clean a streamed continuation chunk: drop fences, leaked meta, stray sentinel. */
+function sanitizeContinuation(s) {
+  let t = stripCodeFences(String(s == null ? "" : s));
+  t = cleanCodeBody(t).replace(/```/g, "").replace(/\bALREADY_COMPLETE\b/gi, "");
+  return t;
+}
+/** System prompt for FINISHING a cut-off code file: output ONLY the missing tail. */
 function codeContinueSystemPrompt(meta) {
   const label = (meta && meta.label) || "code";
   return [
-    "You are continuing a partially-written " + label + " file that was cut off mid-output.",
-    "You will be shown the user's original request and the code written SO FAR (the last assistant message).",
-    "Output the EXACT continuation — the characters that come immediately AFTER the existing code, so that (existing + your output) is ONE valid, complete file.",
+    "You are FINISHING a single " + label + " file that was cut off mid-output and is INCOMPLETE.",
+    "You are given the user's request and the code written SO FAR (the last assistant message). It ends abruptly.",
+    "Output ONLY the missing remainder — the characters immediately AFTER the existing code — so that (existing + your output) is ONE complete, valid file.",
     "STRICT RULES:",
-    "- Do NOT repeat, restate, or re-output any code that already exists. Begin precisely at the first missing character (mid-line if it was cut mid-line).",
-    "- Do NOT add explanations, notes about continuing, Markdown code fences, or any prose. Output ONLY raw " + label + " source.",
-    "- Finish the file fully: close every open tag, bracket, and string (e.g. end HTML with </html>).",
-    "- If the existing code is already a complete, valid file, output ONLY this exact token and nothing else: ALREADY_COMPLETE",
+    "- Continue from the EXACT last character. Do NOT restart, do NOT repeat or re-output any line that already exists, do NOT summarize.",
+    "- Output ONLY raw " + label + " source. No explanations, no Markdown code fences, no new ```firas-code blocks, no JSON metadata.",
+    "- Finish the file COMPLETELY: close every open tag/bracket/string. For HTML, finish <style>, </head>, the full <body> markup and scripts, and end with </html>.",
   ].join("\n");
 }
 
-/** Concatenate a continuation onto existing code, trimming any overlap the model
-    accidentally repeated at the seam. */
+/** Concatenate a continuation onto existing code, removing any span the model
+    repeated — whether at the seam OR by restarting from an earlier point (which
+    otherwise balloons the file with duplicated sections). */
 function joinCodeContinuation(existing, cont) {
   if (!existing) return cont || "";
   if (!cont) return existing;
-  // Trim the longest overlap the model accidentally repeated at the seam. Floor of
-  // 10 chars so a real repeat (a line or more) is caught while a short coincidental
-  // match isn't eaten.
-  const maxOv = Math.min(existing.length, cont.length, 800);
+  // 1) Seam overlap: cont's prefix equals existing's suffix.
+  const maxOv = Math.min(existing.length, cont.length, 4000);
   for (let n = maxOv; n >= 10; n--) {
     if (existing.slice(existing.length - n) === cont.slice(0, n)) return existing + cont.slice(n);
+  }
+  // 2) Restart: the model re-emitted starting from an EARLIER point. Locate cont's
+  //    opening chunk inside existing, align forward, and keep only what is genuinely
+  //    new — but only trust it when the alignment runs to existing's end (a true
+  //    restart), so we never eat real code on a coincidental match.
+  const head = cont.slice(0, 80);
+  if (head.replace(/\s/g, "").length >= 24) {
+    const at = existing.lastIndexOf(head.slice(0, 48));
+    if (at >= 0) {
+      let i = at, j = 0;
+      while (i < existing.length && j < cont.length && existing[i] === cont[j]) { i++; j++; }
+      if (i >= existing.length - 4) return existing + cont.slice(j);
+    }
   }
   return existing + cont;
 }
@@ -4098,21 +4132,40 @@ async function continueCode(card) {
   const meta = aiMsg ? parseCodeMeta(aiMsg.content) : null;
   if (!meta) return;
   const ar = (aiMsg.lang || state.lang) === "ar";
-  let code = meta.code != null ? meta.code : "";
+  // Clean any leaked firas-code meta out of the existing body first.
+  let code = cleanCodeBody(meta.code != null ? meta.code : "");
 
-  // Context: prior turns (code unwrapped to raw), the code so far as the assistant's
-  // last message, then an explicit "continue exactly" instruction.
+  const writeBack = (c) => {
+    aiMsg.content = "```firas-code " + JSON.stringify({ filename: meta.filename, lang: meta.lang, ext: meta.ext, label: meta.label }) + "\n" + c + "\n```";
+    persistChat(chat);
+  };
+  const rerender = () => {
+    const fresh = parseCodeMeta(aiMsg.content);
+    if (fresh && card.isConnected) card.replaceWith(buildCodeCard(fresh, aiMsg.lang || state.lang));
+    else card.classList.remove("is-streaming");
+  };
+
+  // Genuinely complete already (ends with </html> etc.) → just persist the cleanup.
+  if (codeLooksComplete(code, meta.lang)) {
+    writeBack(code); rerender();
+    showToast(ar ? "الكود مكتمل بالفعل ✅" : "Already complete ✅");
+    return;
+  }
+
+  // Context: prior turns (code unwrapped + cleaned), the code so far as the
+  // assistant's last message, then an explicit "finish it" instruction.
   const prior = chat.messages.slice(0, idx).map((m) => {
-    if (m.role === "assistant") { const cm = parseCodeMeta(m.content); if (cm) return { role: "assistant", content: cm.code }; }
+    if (m.role === "assistant") { const cm = parseCodeMeta(m.content); if (cm) return { role: "assistant", content: cleanCodeBody(cm.code) }; }
     return { role: m.role, content: m.content };
   }).filter((m) => m.content && (m.role === "user" || m.role === "assistant"));
+  const lbl = meta.label || (ar ? "كود" : "code");
   const messages = [
     { role: "system", content: codeContinueSystemPrompt(meta) },
     ...prior,
     { role: "assistant", content: code },
     { role: "user", content: ar
-      ? "الكود أعلاه توقف قبل أن يكتمل. أكمله تمامًا من حيث توقف بالضبط — أخرج فقط بقية الكود الخام (الأحرف التالية) دون تكرار أي شيء مكتوب ودون أي شرح أو علامات ```. إن كان مكتملًا فأخرج فقط الكلمة: ALREADY_COMPLETE"
-      : "The code above stopped before completing. Continue it EXACTLY from where it stops — output ONLY the remaining raw code (the next characters), with no repetition and no commentary or ``` fences. If it is already complete, output ONLY: ALREADY_COMPLETE" },
+      ? `هذا الملف (${lbl}) توقّف قبل أن يكتمل وهو ناقص. أكمله من حيث توقّف بالضبط وأنهِه بالكامل (أغلق كل الوسوم والأقواس؛ ولِلـHTML أكمل <style> و</head> و<body> كاملًا والسكربتات وانتهِ بـ </html>). أخرج فقط بقية الكود الخام، دون إعادة أي سطر موجود ودون أي شرح أو علامات \`\`\`.`
+      : `This ${lbl} file stopped before completing and is INCOMPLETE. Continue from exactly where it stops and finish it fully (close every tag/bracket; for HTML complete <style>, </head>, the full <body> and scripts, and end with </html>). Output ONLY the remaining raw code, never re-output an existing line, no commentary or \`\`\` fences.` },
   ];
 
   // Flip the finished card into a "continuing…" streaming state.
@@ -4134,36 +4187,31 @@ async function continueCode(card) {
   let tail = "";
   const onDelta = (full) => {
     tail = full;
-    const merged = joinCodeContinuation(code, stripCodeFences(tail));
+    const merged = joinCodeContinuation(code, sanitizeContinuation(tail));
     if (codeEl) codeEl.textContent = merged;
     const cnt = card.querySelector(".code-card__count");
     if (cnt) cnt.textContent = codeLineCountText(merged, meta.lang);
     if (body) body.scrollTop = body.scrollHeight;
   };
 
-  const persistMerge = (contRaw) => {
-    const cont = stripCodeFences(contRaw || "").trim();
-    if (!cont || /^ALREADY_COMPLETE\s*$/i.test(cont)) return false;
-    code = joinCodeContinuation(code, cont);
-    aiMsg.content = "```firas-code " + JSON.stringify({ filename: meta.filename, lang: meta.lang, ext: meta.ext, label: meta.label }) + "\n" + code + "\n```";
-    persistChat(chat);
-    return true;
-  };
-
   try {
     const out = await streamAgentText(messages, "ultra", controller.signal, onDelta);
-    if (persistMerge(out)) showToast(ar ? "تم إكمال الكود ✅" : "Code continued ✅");
-    else showToast(ar ? "الكود مكتمل بالفعل ✅" : "Already complete ✅");
+    const cont = sanitizeContinuation(out);
+    if (cont.trim()) {
+      code = joinCodeContinuation(code, cont); writeBack(code);
+      showToast(ar ? "تم إكمال الكود ✅" : "Code continued ✅");
+    } else {
+      writeBack(code); // at least save the corruption cleanup
+      showToast(ar ? "تعذّر الإكمال — اضغط «كمّل» مرة أخرى" : "Couldn't continue — click Continue again");
+    }
   } catch (err) {
-    if (controller.signal.aborted) persistMerge(tail); // keep what streamed before Stop
-    else { persistMerge(tail); showToast(ar ? "تعذّر إكمال الكود، حاول مجددًا" : "Couldn't continue — try again"); }
+    const cont = sanitizeContinuation(tail);
+    if (cont.trim()) { code = joinCodeContinuation(code, cont); writeBack(code); }
+    if (!controller.signal.aborted) showToast(ar ? "تعذّر إكمال الكود، حاول مجددًا" : "Couldn't continue — try again");
   } finally {
     activeStreams.delete(chat.id);
     syncStreamingUi();
-    // Rebuild the finished card (refreshed code + full button row).
-    const fresh = parseCodeMeta(aiMsg.content);
-    if (fresh && card.isConnected) card.replaceWith(buildCodeCard(fresh, aiMsg.lang || state.lang));
-    else card.classList.remove("is-streaming");
+    rerender();
   }
 }
 
