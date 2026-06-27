@@ -45,7 +45,10 @@ const TIERS = {
   // (gpt-oss) before the last-resort pollinations fallback.
   max:   { model: env("OLLAMA_MODEL_MAX") || "qwen3-coder:480b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: true },
 };
-const OLLAMA_MODEL_VISION = env("OLLAMA_MODEL_VISION") || "qwen2.5vl:7b";
+// Vision model. The edge ALWAYS talks to Ollama cloud, which does NOT host the
+// local-only qwen2.5vl — so use a CLOUD-hosted multimodal model. gemma3:27b-cloud
+// is free, available, and reads images (verified). Env-overridable.
+const OLLAMA_MODEL_VISION = env("OLLAMA_MODEL_VISION") || "gemma3:27b-cloud";
 const MAX_IMAGES_PER_REQUEST = 6;
 const MAX_IMAGE_B64_BYTES = 8000000;
 const SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
