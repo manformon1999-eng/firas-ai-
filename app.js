@@ -514,7 +514,7 @@ const CODE_BUILD_VERBS =
   /(اصنع|إصنع|اعمل|إعمل|سو[يّ]?ي?|سويي|ابن[يي]|أبني|اكتب|أكتب|انشئ|أنشئ|صم[مّ]|generate|create|make|build|write|develop|design|implement|code\s+me|build\s+me)/i;
 // Hard signals = unambiguous programming intent.
 const CODE_HARD =
-  /\bhtml\b|\bcss\b|\bjavascript\b|vanilla\s*js|كود|\bcode\b|سكربت|سكريبت|\bscript\b|<!doctype/i;
+  /\bhtml\b|\bcss\b|\bjavascript\b|vanilla\s*js|كود|\bcode\b|سكربت|سكريبت|\bscript\b|<!doctype|\bc\+\+|\bcpp\b|\bjava\b|\bc#|csharp|\brust\b|\bgolang\b|\bkotlin\b|\bswift\b|\bphp\b|\btypescript\b|\bpython\b|بايثون|برنامج|برمجة|سي\s*بلس\s*بلس|جافا/i;
 // Soft signals = web words that only count alongside a build verb.
 const CODE_SOFT =
   /موقع|\bwebsite\b|web\s*site|web\s*page|webpage|صفحة\s*ويب|landing\s*page|single[-\s]?file/i;
@@ -531,8 +531,17 @@ function codeSpecFromText(text) {
   const s = String(text).toLowerCase();
   const webby = /\bhtml\b|website|web\s*site|web\s*page|موقع|صفحة|<!doctype/.test(s);
   if (/\bpython\b|بايثون/.test(s) && !webby) return { lang: "python", ext: "py", label: "Python", filename: "script.py" };
+  if (/\bc\+\+|\bcpp\b|سي\s*بلس\s*بلس|سي\+\+/.test(s) && !webby) return { lang: "cpp", ext: "cpp", label: "C++", filename: "main.cpp" };
+  if ((/\bjava\b/.test(s) || /جافا/.test(s)) && !/javascript|جافا\s*سكر|جافاسكربت/.test(s) && !webby) return { lang: "java", ext: "java", label: "Java", filename: "Main.java" };
+  if (/\bc#|c\s*sharp|csharp|سي\s*شارب/.test(s) && !webby) return { lang: "csharp", ext: "cs", label: "C#", filename: "Program.cs" };
+  if (/\brust\b|راست/.test(s) && !webby) return { lang: "rust", ext: "rs", label: "Rust", filename: "main.rs" };
+  if (/\bgolang\b|لغة\s*go/.test(s) && !webby) return { lang: "go", ext: "go", label: "Go", filename: "main.go" };
+  if (/\bkotlin\b|كوتلن/.test(s) && !webby) return { lang: "kotlin", ext: "kt", label: "Kotlin", filename: "Main.kt" };
+  if (/\bswift\b|سويفت/.test(s) && !webby) return { lang: "swift", ext: "swift", label: "Swift", filename: "main.swift" };
+  if (/\bphp\b/.test(s) && !webby) return { lang: "php", ext: "php", label: "PHP", filename: "index.php" };
+  if (/\btypescript\b/.test(s) && !webby) return { lang: "typescript", ext: "ts", label: "TypeScript", filename: "main.ts" };
   if (/\bcss\b|stylesheet/.test(s) && !webby) return { lang: "css", ext: "css", label: "CSS", filename: "styles.css" };
-  if ((/\bjavascript\b|vanilla\s*js|\bnode(?:\.js)?\b/.test(s) || /\bjs\b/.test(s)) && !webby)
+  if ((/\bjavascript\b|vanilla\s*js|\bnode(?:\.js)?\b|جافا\s*سكر|جافاسكربت/.test(s) || /\bjs\b/.test(s)) && !webby)
     return { lang: "javascript", ext: "js", label: "JavaScript", filename: "script.js" };
   return { lang: "html", ext: "html", label: "HTML", filename: "index.html" };
 }
@@ -1080,7 +1089,10 @@ function stripCodeFences(s) {
 }
 function codeMime(ext) {
   return ({ html: "text/html", css: "text/css", js: "text/javascript",
-    py: "text/x-python", json: "application/json", txt: "text/plain" })[ext] || "text/plain";
+    py: "text/x-python", json: "application/json", txt: "text/plain",
+    cpp: "text/x-c++src", c: "text/x-csrc", java: "text/x-java-source", cs: "text/plain",
+    rs: "text/rust", go: "text/x-go", php: "application/x-httpd-php", ts: "text/typescript",
+    kt: "text/x-kotlin", swift: "text/x-swift" })[ext] || "text/plain";
 }
 function codeLineCountText(code, lang) {
   const n = String(code || "").split("\n").length;
@@ -4190,6 +4202,50 @@ async function autoCompleteCode(code, codeReq, convo, lang, signal, onChunk) {
   return code;
 }
 
+/** DEVELOP pass: once an HTML site is COMPLETE, weave in an advanced, professional
+    vanilla-JS layer (nav, modals, cart, sliders, tabs, form validation, scroll
+    animations, counters, theme toggle…) so the site is genuinely interactive — not
+    static. Bounded + additive (inserts ONE <script> before </body>), so the result
+    stays ONE complete file. No-op on non-HTML, failure, or an empty script. */
+async function enhanceCodeInteractivity(code, codeReq, lang, signal, onChunk) {
+  if (!codeReq || codeReq.lang !== "html" || signal.aborted) return code;
+  // If the page ALREADY has real JS, don't add a second layer (avoids double-bound
+  // handlers / conflicts). Only enhance sites that are static or barely scripted.
+  const existingJs = (code.match(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi) || []).join("");
+  if (existingJs.replace(/<\/?script[^>]*>/gi, "").replace(/\s/g, "").length > 600) return code;
+  const ar = lang === "ar";
+  // Bounded context — the model needs to SEE the markup (classes/ids) it wires up.
+  let ctx = code;
+  if (code.length > 140000) ctx = code.slice(0, 3000) + "\n/* …styles omitted… */\n" + code.slice(code.length - 130000);
+  const messages = [
+    { role: "system", content: [
+      "You are a senior front-end engineer. You are given a COMPLETE single-file HTML page.",
+      "Write ONE complete, professional, BUG-FREE vanilla-JavaScript layer that makes the page genuinely interactive and advanced.",
+      "Wire up only what actually exists in the markup: nav/menu toggles, buttons, any cart/modals/dialogs, sliders/carousels/tabs/accordions, forms with validation, scroll-reveal animations, animated counters, smooth scrolling, and a theme/dark-mode toggle if appropriate.",
+      "Use the EXISTING class names and ids. Null-check every selector so nothing throws if an element is absent. No external libraries.",
+      "Output ONLY one block: <script> …raw JS… </script>. No explanations, no Markdown fences, no other HTML.",
+    ].join("\n") },
+    { role: "user", content: ctx },
+    { role: "user", content: ar
+      ? "أضف طبقة جافاسكربت احترافية كاملة وخالية من الأخطاء تجعل كل عناصر الصفحة تعمل وتفاعلية ومتطوّرة. أخرج فقط كتلة <script>...</script> واحدة."
+      : "Add a complete, error-free professional JavaScript layer that makes every element work and feel advanced. Output ONLY one <script>...</script> block." },
+  ];
+  if (onChunk) onChunk(code); // show current code + the "enhancing" status
+  let out = "";
+  try { out = await streamAgentText(messages, "ultra", signal, null); } catch (e) { return code; }
+  let js = sanitizeContinuation(out).trim();
+  if (!js) return code;
+  const m = js.match(/<script[\s\S]*?<\/script>/i);
+  const block = m ? m[0] : ("<script>\n" + js.replace(/<\/?script[^>]*>/gi, "").trim() + "\n</script>");
+  if (!block.replace(/<\/?script[^>]*>/gi, "").replace(/\s/g, "")) return code; // empty → skip
+  let enhanced;
+  if (/<\/body>/i.test(code)) enhanced = code.replace(/<\/body>/i, block + "\n</body>");
+  else if (/<\/html>/i.test(code)) enhanced = code.replace(/<\/html>/i, block + "\n</html>");
+  else enhanced = code + "\n" + block;
+  if (onChunk) onChunk(enhanced);
+  return enhanced;
+}
+
 /** Resume a code card whose file stopped before completing. Streams the missing
     tail from the coder model and appends it seamlessly into the SAME box, then
     persists. Safe to click repeatedly for very long files. */
@@ -4681,18 +4737,25 @@ async function streamAnswer(aiMsg, aiNode, chat) {
       // Persist as a code block: ```firas-code {meta}\n<code>\n``` → renders the
       // finished code card (copy/download/preview) and survives reload.
       let code = sanitizeContinuation(stripCodeFences(answer));
-      // AUTO-COMPLETE: if the model was cut off, keep continuing internally until the
-      // file is whole — so ONE request yields a large COMPLETE file (no manual clicks).
-      // The growth renders live; Stop (signal) interrupts it.
+      const renderCode = (merged, status) => {
+        const node = liveNode(); const mdEl = node && node.querySelector(".msg-ai__body .md");
+        if (!mdEl) return;
+        renderLiveCodeInto(mdEl, merged, codeReq, replyLang);
+        const w = mdEl.querySelector(".code-card__writing");
+        if (w && status) w.textContent = status;
+        mdEl.classList.remove("stream-caret");
+      };
+      // 1) AUTO-COMPLETE: if the model was cut off, keep continuing internally until
+      // the file is whole — so ONE request yields a large COMPLETE file (no clicks).
       if (!signal.aborted && !codeLooksComplete(code, codeReq.lang)) {
-        code = await autoCompleteCode(code, codeReq, convo, replyLang, signal, (merged) => {
-          const node = liveNode(); const mdEl = node && node.querySelector(".msg-ai__body .md");
-          if (!mdEl) return;
-          renderLiveCodeInto(mdEl, merged, codeReq, replyLang);
-          const w = mdEl.querySelector(".code-card__writing");
-          if (w) w.textContent = replyLang === "ar" ? "يُكمل تلقائيًا…" : "Auto-completing…";
-          mdEl.classList.remove("stream-caret");
-        });
+        code = await autoCompleteCode(code, codeReq, convo, replyLang, signal,
+          (m) => renderCode(m, replyLang === "ar" ? "يُكمل تلقائيًا…" : "Auto-completing…"));
+      }
+      // 2) DEVELOP: once a sizeable HTML site is complete, add an advanced JS layer so
+      // it's genuinely interactive — still ONE complete file at the end.
+      if (codeReq.lang === "html" && !signal.aborted && code.length > 6000 && codeLooksComplete(code, "html")) {
+        code = await enhanceCodeInteractivity(code, codeReq, replyLang, signal,
+          (m) => renderCode(m, replyLang === "ar" ? "يطوّر التفاعلية والجافاسكربت…" : "Enhancing interactivity…"));
       }
       const meta = { filename: codeReq.filename, lang: codeReq.lang, ext: codeReq.ext, label: codeReq.label };
       aiMsg.content = "```firas-code " + JSON.stringify(meta) + "\n" + code + "\n```";
