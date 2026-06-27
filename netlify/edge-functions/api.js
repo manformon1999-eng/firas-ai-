@@ -17,6 +17,15 @@ const OLLAMA_API_KEY = env("OLLAMA_API_KEY") || "";
 const OLLAMA_CHAT_URL= OLLAMA_HOST + "/api/chat";
 const FALLBACK_URL   = "https://text.pollinations.ai/openai";
 const FALLBACK_MODEL = "openai";
+// PREMIUM "Max" tier engines (server-side keys only — end users stay keyless).
+// Max chain: Claude Sonnet (paid) → OpenRouter free (DeepSeek-R1) → Ollama/pollinations.
+const ANTHROPIC_API_KEY  = env("ANTHROPIC_API_KEY") || "";
+const ANTHROPIC_MODEL    = env("ANTHROPIC_MODEL") || "claude-sonnet-4-6";
+const ANTHROPIC_URL      = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MAX_TOK  = Math.max(1024, parseInt(env("ANTHROPIC_MAX_TOKENS") || "8192", 10) || 8192);
+const OPENROUTER_API_KEY = env("OPENROUTER_API_KEY") || "";
+const OPENROUTER_MODEL   = env("OPENROUTER_MODEL") || "nvidia/nemotron-3-ultra-550b-a55b:free";
+const OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions";
 const UPSTREAM_TIMEOUT_MS = Number(env("REQUEST_TIMEOUT_MS")) || 300000;
 
 const COOKIE_NAME = "firas_session";
@@ -34,7 +43,7 @@ const TIERS = {
   // Env-overridable so the model can be swapped without a redeploy if Ollama's
   // cloud catalog rotates. fallbackModel degrades to a known-good hosted model
   // (gpt-oss) before the last-resort pollinations fallback.
-  max:   { model: env("OLLAMA_MODEL_MAX") || "deepseek-v3.1:671b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: true },
+  max:   { model: env("OLLAMA_MODEL_MAX") || "qwen3-coder:480b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: true },
 };
 const OLLAMA_MODEL_VISION = env("OLLAMA_MODEL_VISION") || "qwen2.5vl:7b";
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -284,7 +293,14 @@ function chatStreamResponse(messages, tier, think, vision) {
       const enc = (s) => { if (closed || !s) return; try { controller.enqueue(te.encode(s)); } catch (_) { closed = true; } };
       const finish = () => { if (closed) return; closed = true; try { controller.enqueue(te.encode("data: [DONE]\n\n")); } catch (_) {} try { controller.close(); } catch (_) {} clearTimeout(timeout); };
       try {
-        const okOllama = await streamOllamaInto(enc, ollamaMessages, tier, think, ac.signal, modelOverride);
+        let served = false;
+        // Max tier → premium external engines FIRST: Claude Sonnet (paid), then
+        // OpenRouter free (DeepSeek-R1) when Claude has no credit/fails.
+        if (tier === "max" && !vision) {
+          served = await streamAnthropicInto(enc, messages, ac.signal);
+          if (!served && !closed) served = await streamOpenRouterInto(enc, messages, ac.signal);
+        }
+        const okOllama = served ? true : await streamOllamaInto(enc, ollamaMessages, tier, think, ac.signal, modelOverride);
         if (!okOllama && !closed) {
           if (vision) { enc(sseFrame("The Firas AI vision engine is offline right now, so I can't view images. Please try again shortly.")); }
           else {
@@ -374,6 +390,77 @@ async function streamFallbackInto(enc, messages, tier, think, signal) {
     if (cleaned) { const f = sseFrame(cleaned, ""); if (f) enc(f); }
     else if (!reasoningAcc) { const f = sseFrame("The Firas AI engine is busy right now. Please try again."); if (f) enc(f); }
   } catch (e) { /* end gracefully */ }
+}
+
+// ── Max engine: Claude (Anthropic Messages API → our SSE). Returns true if it
+// streamed any answer, false if it failed BEFORE any bytes (no key / no-credit /
+// error) so the caller can fall back. Does NOT send [DONE] (finish() does). ──
+async function streamAnthropicInto(enc, messages, signal) {
+  if (!ANTHROPIC_API_KEY) return false;
+  const system = messages.filter((m) => m.role === "system").map((m) => String(m.content || "")).join("\n\n");
+  const conv = messages.filter((m) => m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: String(m.content || "") }));
+  while (conv.length && conv[0].role !== "user") conv.shift();
+  if (!conv.length) return false;
+  const reqBody = JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: ANTHROPIC_MAX_TOK, stream: true, ...(system ? { system } : {}), messages: conv });
+  let upstream;
+  try { upstream = await fetch(ANTHROPIC_URL, { method: "POST", headers: { "content-type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" }, body: reqBody, signal }); }
+  catch (e) { return signal.aborted ? true : false; }
+  if (!upstream.ok || !upstream.body) { try { upstream && upstream.body && upstream.body.cancel(); } catch (_) {} return false; }
+  const reader = upstream.body.getReader(); let buffer = "", any = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buffer += td.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let evt; try { evt = JSON.parse(payload); } catch { continue; }
+        if (evt.type === "content_block_delta" && evt.delta) {
+          if (evt.delta.type === "text_delta" && evt.delta.text) { const f = sseFrame(evt.delta.text); if (f) enc(f); any = true; }
+          else if (evt.delta.type === "thinking_delta" && evt.delta.thinking) { const f = sseFrame("", evt.delta.thinking); if (f) enc(f); }
+        } else if (evt.type === "error" && !any) { return false; }
+      }
+    }
+    return any;
+  } catch (e) { return signal.aborted ? true : any; }
+}
+
+// ── Max engine: OpenRouter (OpenAI-compatible, free DeepSeek-R1) ──
+async function streamOpenRouterInto(enc, messages, signal) {
+  if (!OPENROUTER_API_KEY) return false;
+  const msgs = messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant").map((m) => ({ role: m.role, content: String(m.content || "") }));
+  if (!msgs.length) return false;
+  const reqBody = JSON.stringify({ model: OPENROUTER_MODEL, messages: msgs, stream: true });
+  let upstream;
+  try { upstream = await fetch(OPENROUTER_URL, { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + OPENROUTER_API_KEY, "HTTP-Referer": "https://firasai.netlify.app", "X-Title": "Firas AI" }, body: reqBody, signal }); }
+  catch (e) { return signal.aborted ? true : false; }
+  if (!upstream.ok || !upstream.body) { try { upstream && upstream.body && upstream.body.cancel(); } catch (_) {} return false; }
+  const reader = upstream.body.getReader(); let buffer = "", any = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read(); if (done) break;
+      buffer += td.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let evt; try { evt = JSON.parse(payload); } catch { continue; }
+        const delta = evt.choices && evt.choices[0] && evt.choices[0].delta;
+        if (delta) {
+          if (delta.reasoning) { const f = sseFrame("", delta.reasoning); if (f) enc(f); }
+          if (delta.content) { const f = sseFrame(delta.content); if (f) enc(f); any = true; }
+        }
+      }
+    }
+    return any;
+  } catch (e) { return signal.aborted ? true : any; }
 }
 
 /* ---------------- DuckDuckGo search (ported) ---------------- */

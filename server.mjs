@@ -22,6 +22,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Load a local .env (KEY=value lines) if present, so secrets like OPENROUTER_API_KEY
+// can be dropped in a gitignored file instead of exported each run. Real env vars
+// still win (loadEnvFile does not overwrite already-set process.env). Node 20.12+.
+try { process.loadEnvFile(path.join(__dirname, ".env")); } catch (_) { /* no .env — fine */ }
+
 const PORT = process.env.PORT || process.argv[2] || 3000;
 
 /* ---------------------------------------------------------------------------
@@ -46,6 +52,16 @@ function ollamaHeaders() {
   return h;
 }
 
+// PREMIUM "Max" tier engines (server-side keys only — end users stay keyless).
+// Max chain: Claude Sonnet (paid) → OpenRouter free (DeepSeek-R1) → Ollama/pollinations.
+const ANTHROPIC_API_KEY  = process.env.ANTHROPIC_API_KEY || "";
+const ANTHROPIC_MODEL    = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const ANTHROPIC_URL      = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_MAX_TOK  = Math.max(1024, parseInt(process.env.ANTHROPIC_MAX_TOKENS, 10) || 8192);
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_MODEL   = process.env.OPENROUTER_MODEL || "nvidia/nemotron-3-ultra-550b-a55b:free";
+const OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions";
+
 // Tier -> Ollama model + generation params (env-overridable).
 // num_predict = MAX output tokens. Generous so long outputs (a full single-file
 // website, big code, long derivations) are NOT truncated mid-answer. The model
@@ -68,7 +84,7 @@ const TIERS = {
   // Env-overridable so the model swaps without a redeploy if Ollama's cloud catalog
   // rotates. fallbackModel degrades to a known-good hosted model (gpt-oss) before the
   // last-resort pollinations fallback.
-  max:   { model: process.env.OLLAMA_MODEL_MAX || "deepseek-v3.1:671b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: process.env.OLLAMA_MODEL_MAX_FALLBACK || "gpt-oss:120b-cloud", capped: true },
+  max:   { model: process.env.OLLAMA_MODEL_MAX || "qwen3-coder:480b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: process.env.OLLAMA_MODEL_MAX_FALLBACK || "gpt-oss:120b-cloud", capped: true },
 };
 
 // Vision/multimodal model — used automatically when a request carries images.
@@ -1174,6 +1190,99 @@ function handleVersion(req, res) {
   res.end(JSON.stringify({ version: Math.floor(v) }));
 }
 
+// ── Max engine: Claude (Anthropic Messages API → our SSE) ───────────────────
+// Returns true if it streamed any answer, false if it failed BEFORE any bytes
+// (no key / 402 no-credit / error) so the caller can fall back. Does NOT send the
+// terminal [DONE] — handleChat's finally does that.
+async function streamAnthropic(res, messages, signal) {
+  if (!ANTHROPIC_API_KEY) return false;
+  // Anthropic takes system text as a top-level field; messages must be user/assistant.
+  const system = messages.filter((m) => m.role === "system").map((m) => String(m.content || "")).join("\n\n");
+  const conv = messages
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => ({ role: m.role, content: String(m.content || "") }));
+  while (conv.length && conv[0].role !== "user") conv.shift(); // Anthropic must start with user
+  if (!conv.length) return false;
+  const body = JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: ANTHROPIC_MAX_TOK, stream: true, ...(system ? { system } : {}), messages: conv });
+  let upstream;
+  try {
+    upstream = await fetch(ANTHROPIC_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body, signal,
+    });
+  } catch (e) { return signal.aborted ? true : false; }
+  if (!upstream.ok || !upstream.body) { console.error("[firas] Max→Claude HTTP " + (upstream && upstream.status) + " — falling back"); try { upstream && upstream.body && upstream.body.cancel(); } catch (_) {} return false; }
+  const decoder = new TextDecoder();
+  let buffer = "", any = false;
+  try {
+    for await (const chunk of upstream.body) {
+      if (res.writableEnded) break;
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let evt; try { evt = JSON.parse(payload); } catch { continue; }
+        if (evt.type === "content_block_delta" && evt.delta) {
+          if (evt.delta.type === "text_delta" && evt.delta.text) { sseWrite(res, evt.delta.text); any = true; }
+          else if (evt.delta.type === "thinking_delta" && evt.delta.thinking) { sseWrite(res, "", evt.delta.thinking); }
+        } else if (evt.type === "error" && !any) {
+          return false; // upstream error before any content → fall back
+        }
+      }
+    }
+    if (any) console.log("[firas] Max served by Claude (" + ANTHROPIC_MODEL + ")");
+    return any; // true = served; false = nothing came → caller falls back
+  } catch (e) { return signal.aborted ? true : any; }
+}
+
+// ── Max engine: OpenRouter (OpenAI-compatible, free DeepSeek-R1) ─────────────
+async function streamOpenRouter(res, messages, signal) {
+  if (!OPENROUTER_API_KEY) return false;
+  const msgs = messages
+    .filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant")
+    .map((m) => ({ role: m.role, content: String(m.content || "") }));
+  if (!msgs.length) return false;
+  const body = JSON.stringify({ model: OPENROUTER_MODEL, messages: msgs, stream: true });
+  let upstream;
+  try {
+    upstream = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + OPENROUTER_API_KEY, "HTTP-Referer": "https://firasai.netlify.app", "X-Title": "Firas AI" },
+      body, signal,
+    });
+  } catch (e) { return signal.aborted ? true : false; }
+  if (!upstream.ok || !upstream.body) { console.error("[firas] Max→OpenRouter HTTP " + (upstream && upstream.status) + " — falling back"); try { upstream && upstream.body && upstream.body.cancel(); } catch (_) {} return false; }
+  const decoder = new TextDecoder();
+  let buffer = "", any = false;
+  try {
+    for await (const chunk of upstream.body) {
+      if (res.writableEnded) break;
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        let evt; try { evt = JSON.parse(payload); } catch { continue; }
+        const delta = evt.choices && evt.choices[0] && evt.choices[0].delta;
+        if (delta) {
+          if (delta.reasoning) sseWrite(res, "", delta.reasoning);   // R1 thinking
+          if (delta.content) { sseWrite(res, delta.content); any = true; }
+        }
+      }
+    }
+    if (any) console.log("[firas] Max served by OpenRouter (" + OPENROUTER_MODEL + ")");
+    return any;
+  } catch (e) { return signal.aborted ? true : any; }
+}
+
 async function streamFallback(res, messages, tier, think, signal) {
   const body = JSON.stringify({ model: FALLBACK_MODEL, messages, stream: true });
   let upstream;
@@ -1291,7 +1400,15 @@ async function handleChat(req, res) {
   sseInit(res);
 
   try {
-    const ok = await streamOllama(res, ollamaMessages, tier, think, ac.signal, modelOverride);
+    let served = false;
+    // Max tier → premium external engines FIRST: Claude Sonnet (paid), then
+    // OpenRouter free (DeepSeek-R1) when Claude has no credit/fails. Each returns
+    // false if it failed before any bytes, so the chain degrades cleanly.
+    if (tier === "max" && !vision) {
+      served = await streamAnthropic(res, messages, ac.signal);
+      if (!served && !res.writableEnded) served = await streamOpenRouter(res, messages, ac.signal);
+    }
+    const ok = served ? true : await streamOllama(res, ollamaMessages, tier, think, ac.signal, modelOverride);
     if (!ok && !res.writableEnded) {
       if (vision) {
         // Pollinations fallback is text-only; it cannot see images. Tell the

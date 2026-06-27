@@ -86,7 +86,7 @@ const MODELS = {
     key: "max",
     transport: "openai",
     label: { ar: "فِراس ماكس", en: "Firas Max" },
-    tagline: { ar: "الأقوى — تفكير عميق ٦٧١B (حد يومي)", en: "Strongest — 671B deep reasoning (daily limit)" },
+    tagline: { ar: "الأقوى — أعلى ذكاء وتفكير (حد يومي)", en: "Strongest — top intelligence (daily limit)" },
     short: { ar: "ماكس", en: "Max" },
     reasoning_effort: "high",
     temperature: 0.7,
