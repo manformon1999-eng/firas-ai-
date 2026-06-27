@@ -947,6 +947,29 @@ function detectImageRequest(text) {
   const en = /\b(generate|create|make|draw|paint|design|render)\b[^.?!\n]{0,48}?\b(image|picture|photo|drawing|illustration|artwork|logo|logotype|poster|wallpaper|background|portrait|banner|icon|avatar|emblem|mockup|sticker|thumbnail)\b/i;
   return ar.test(s) || arDraw.test(s) || en.test(s);
 }
+
+/** Detect a request for Arabic grammatical analysis (إعراب). "أعرب/اعرب/إعراب" mean
+    grammatical parsing — distinct from "عرّب" (Arabize) and "العرب" (the Arabs). */
+function detectIrabRequest(text) {
+  if (!text) return false;
+  const s = String(text);
+  return /إعراب|اعراب|أعرب|اعرب|أعربها|اعربها|ما\s*(?:هو\s*)?إعراب|حلّل(?:ها)?\s*نحوي|تحليل\s*نحو|نحويًا|نحويا|اعرابي|إعرابي/.test(s);
+}
+
+/** Expert-grammarian system prompt: rigorous, fully-vowelled, word-by-word إعراب,
+    with extra care for the Quran. Injected for ANY model on an إعراب request. */
+function irabSystemPrompt() {
+  return [
+    "أنت عالِمُ نحوٍ وإعرابٍ خبيرٌ، متقِنٌ لقواعد اللغة العربية إتقانًا تامًّا. عند طلب الإعراب أو التحليل النحوي:",
+    "- قسّم النص إلى كلماته كلمةً كلمةً (والأحرفِ إن لزم الأمر)، وأعرِبْ كلَّ كلمة إعرابًا مفصّلًا مضبوطًا.",
+    "- لكلِّ كلمة بيّن: نوعَها (اسم/فعل/حرف)، وموقعَها الإعرابي (مبتدأ، خبر، فاعل، نائب فاعل، مفعول به، مضاف إليه، حال، تمييز، اسم/خبر للناسخ، مجرور بحرف الجر، بدل، نعت، معطوف، توكيد...)، وحالتَها (مرفوع/منصوب/مجرور/مجزوم، أو مبني)، وعلامةَ الإعراب (الضمة/الفتحة/الكسرة/السكون، أو العلامات الفرعية: الواو والألف والياء والنون وثبوت النون أو حذفها، ومنع الصرف)، وسببَ ذلك.",
+    "- أعرِبِ الجُملَ وأشباهَ الجُمل وبيّن محلَّها من الإعراب (في محل رفع/نصب/جر، أو لا محلَّ لها) مع التعليل.",
+    "- إن كان النص آيةً من القرآن الكريم فالتزم أقصى الدقّة، واتّبع ما قرّره أئمّةُ النحو في كتب إعراب القرآن، وأشِرْ إلى القراءات إن أثّرت في الإعراب، وإلى تعدّد الأوجه الإعرابية إن وُجِد.",
+    "- كن صحيحًا مضبوطًا تمامًا ولا تُقدّم إعرابًا خاطئًا؛ وإن لم تتيقّن من وجهٍ فبيّن ذلك بوضوح بدلًا من التخمين.",
+    "- رتّب الإجابة بوضوح: اكتب الكلمة ثم إعرابَها سطرًا سطرًا، واضبط الكلماتِ بالشكل (التشكيل)، بعربيةٍ فصحى سليمة.",
+  ].join("\n");
+}
+
 function parseImageMeta(content) {
   const m = String(content || "").match(/```firas-image\s*([\s\S]*?)```/i);
   if (!m) return null;
@@ -4731,6 +4754,14 @@ async function streamAnswer(aiMsg, aiNode, chat) {
           requestMessages = [requestMessages[0], { role: "system", content: note }, ...requestMessages.slice(1)];
         }
       }
+    }
+    // ARABIC I'RAB (إعراب) → rigorous word-by-word grammatical analysis. The coder
+    // tier (ultra) is weak at grammar, so route it to the general model; inject an
+    // expert-grammarian method so EVERY model parses precisely (esp. the Quran).
+    const lastUForIrab = [...convo].reverse().find((m) => m.role === "user");
+    if (lastUForIrab && !codeReq && !fileFmt && detectIrabRequest(lastUForIrab.content)) {
+      if (requestTier === "ultra") requestTier = "pro";
+      requestMessages = [requestMessages[0], { role: "system", content: irabSystemPrompt() }, ...requestMessages.slice(1)];
     }
     // VISION turn → tell the model to answer thoroughly and, when asked to extract/
     // read text, transcribe ALL of it COMPLETELY and verbatim (not just a summary).
