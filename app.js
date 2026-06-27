@@ -61,7 +61,7 @@ const MODELS = {
     key: "ultra",
     transport: "openai",
     label: { ar: "فِراس أولترا", en: "Firas Ultra" },
-    tagline: { ar: "الأقوى — تفكير عميق", en: "Most powerful — deep reasoning" },
+    tagline: { ar: "قويّ جدًا — الأفضل للأكواد", en: "Very powerful — best for code" },
     short: { ar: "أولترا", en: "Ultra" },
     reasoning_effort: "high",
     temperature: 0.7,
@@ -81,6 +81,28 @@ const MODELS = {
       "dramatically more thorough and in-depth than a basic assistant. When writing " +
       "code or a website, output the FULL code directly inside the code block — do " +
       "NOT precede it with a long written plan or outline; never stop mid-file.",
+  },
+  max: {
+    key: "max",
+    transport: "openai",
+    label: { ar: "فِراس ماكس", en: "Firas Max" },
+    tagline: { ar: "الأقوى — تفكير عميق ٦٧١B (حد يومي)", en: "Strongest — 671B deep reasoning (daily limit)" },
+    short: { ar: "ماكس", en: "Max" },
+    reasoning_effort: "high",
+    temperature: 0.7,
+    max_tokens: 16384,
+    showThinking: true,
+    premium: true,
+    capped: true,          // gated by a per-user daily cap (see /api/max/quota)
+    persona:
+      "You are Firas Max, THE most powerful and intelligent Firas tier — a frontier-level " +
+      "expert. Reason with exceptional depth and rigor, think step by step, and double-check " +
+      "yourself before answering. You are world-class at MATHEMATICS, PHYSICS, the SCIENCES, " +
+      "analysis and complex problem-solving: give fully correct, rigorous, step-by-step " +
+      "derivations and WRAP ALL math in LaTeX (inline $...$, display $$...$$). For PROGRAMMING, " +
+      "deliver clean, correct, complete, runnable code. Be the most thorough, insightful and " +
+      "reliable assistant possible — handle nuance, edge-cases and trade-offs explicitly. " +
+      "Always answer in the user's language.",
   },
 };
 
@@ -374,6 +396,7 @@ const ICONS = {
   check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
   regen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg>',
   continue: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 4 10 8-10 8V4ZM19 4v16"/></svg>',
+  crown: '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 7l4.5 4L12 4l4.5 7L21 7l-1.6 11.2a1 1 0 0 1-1 .8H5.6a1 1 0 0 1-1-.8L3 7Z"/></svg>',
   chevron: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>',
   caret: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>',
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
@@ -389,7 +412,7 @@ const ICONS = {
   fileXls: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13l6 5M15 13l-6 5"/></svg>',
   filePpt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h6a2 2 0 0 1 0 4H8zM8 13v6"/></svg>',
 };
-const TIER_ICON = { mini: ICONS.zap, pro: ICONS.bolt, ultra: ICONS.star };
+const TIER_ICON = { mini: ICONS.zap, pro: ICONS.bolt, ultra: ICONS.star, max: ICONS.crown };
 
 /* Response-mode icons (distinct from tier icons). Auto = lightning bolt
    (direct), Plan = checklist/clipboard (steps). */
@@ -1010,6 +1033,38 @@ function imageRemainingText(lang, q) {
   return lang === "ar"
     ? `تم إنشاء الصورة • تبقّى لك ${arDigits(remaining)} من ${arDigits(limit)} اليوم`
     : `Image created • ${remaining} of ${limit} left today`;
+}
+
+/** Read-only pre-check of the Max-tier daily cap. Mirrors fetchImageQuota:
+    {ok,limit,used,remaining}; ok:false (429) = cap hit; null = fail-open. */
+async function fetchMaxQuota() {
+  try {
+    const r = await fetch("/api/max/quota", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (r.status === 429) {
+      const j = await r.json().catch(() => ({}));
+      return Object.assign({ ok: false, reason: "limit", limit: 10, remaining: 0 }, j);
+    }
+    if (r.status === 401) return { ok: false, reason: "auth" };
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch (_) { return null; }
+}
+function maxLimitText(lang, q) {
+  if (q && q.reason === "auth") {
+    return lang === "ar" ? "🔒 يجب تسجيل الدخول لاستخدام فِراس ماكس." : "🔒 Please sign in to use Firas Max.";
+  }
+  const limit = (q && q.limit) || 10;
+  return lang === "ar"
+    ? `👑 لقد وصلت إلى حدّك اليومي من فِراس ماكس (${arDigits(limit)} رسائل في اليوم). استخدم أولترا أو برو الآن، وسيتجدّد ماكس غداً.`
+    : `👑 You've reached your daily Firas Max limit (${limit} messages per day). Use Ultra or Pro for now — Max resets tomorrow.`;
+}
+function maxRemainingText(lang, q) {
+  const remaining = q.remaining, limit = q.limit || 10;
+  return lang === "ar"
+    ? `فِراس ماكس • تبقّى لك ${arDigits(remaining)} من ${arDigits(limit)} اليوم`
+    : `Firas Max • ${remaining} of ${limit} left today`;
 }
 
 /* ===========================================================================
@@ -4398,12 +4453,28 @@ async function streamAnswer(aiMsg, aiNode, chat) {
     }
     const rtModel = MODELS[requestTier] || tier;
 
+    // Capped tier (Max): block before streaming if the daily cap is exhausted,
+    // else mint a request id so the server charges this send exactly once.
+    let maxCid = "", maxQuota = null;
+    if (requestTier === "max" && CONFIG.BACKEND_URL) {
+      maxQuota = await fetchMaxQuota();
+      if (maxQuota && maxQuota.ok === false) {
+        clearTimeout(timeoutId);
+        finalized = true;
+        aiMsg.content = maxLimitText(replyLang, maxQuota);
+        aiMsg.reasoning = "";
+        finalizeAi(aiMsg, chat);
+        return;
+      }
+      maxCid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ("m" + Date.now() + Math.floor(Math.random() * 1e6));
+    }
+
     let response;
     if (CONFIG.BACKEND_URL) {
       response = await fetch(CONFIG.BACKEND_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: requestMessages, tier: requestTier, think: aiMsg.think && !!(rtModel && rtModel.showThinking) }),
+        body: JSON.stringify({ messages: requestMessages, tier: requestTier, think: aiMsg.think && !!(rtModel && rtModel.showThinking), cid: maxCid || undefined }),
         credentials: "same-origin",
         signal,
       });
@@ -4423,6 +4494,16 @@ async function streamAnswer(aiMsg, aiNode, chat) {
       });
     }
 
+    // Server-side cap hit (race: another tab used the last slot) → friendly notice.
+    if (response.status === 429 && requestTier === "max") {
+      clearTimeout(timeoutId);
+      finalized = true;
+      const j = await response.json().catch(() => ({}));
+      aiMsg.content = maxLimitText(replyLang, Object.assign({ ok: false, reason: "limit" }, j));
+      aiMsg.reasoning = "";
+      finalizeAi(aiMsg, chat);
+      return;
+    }
     if (!response.ok || !response.body) throw new Error("HTTP " + response.status);
 
     const reader = response.body.getReader();
@@ -4473,6 +4554,10 @@ async function streamAnswer(aiMsg, aiNode, chat) {
     }
     aiMsg.reasoning = reasoning;
     finalizeAi(aiMsg, chat);
+    // Show how many Max messages remain today (this send just used one).
+    if (requestTier === "max" && maxQuota && typeof maxQuota.remaining === "number") {
+      showToast(maxRemainingText(replyLang, { ...maxQuota, remaining: Math.max(0, maxQuota.remaining - 1) }));
+    }
   } catch (err) {
     clearTimeout(timeoutId);
     finalized = true;

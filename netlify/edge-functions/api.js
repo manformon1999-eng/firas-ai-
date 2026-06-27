@@ -24,11 +24,17 @@ const COOKIE_MAX_AGE = 2592000;            // 30 days (seconds)
 const MAX_CHATS_PER_USER = 1000;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const IMAGE_DAILY_LIMIT = Math.max(1, parseInt(env("IMAGE_DAILY_LIMIT") || "5", 10) || 5);
+const MAX_DAILY_LIMIT  = Math.max(1, parseInt(env("MAX_DAILY_LIMIT")  || "10", 10) || 10);
 
 const TIERS = {
   mini:  { model: env("OLLAMA_MODEL_MINI")  || "gpt-oss:120b-cloud",     temperature: 0.5, num_predict: 16384 },
   pro:   { model: env("OLLAMA_MODEL_PRO")   || "gpt-oss:120b-cloud",     temperature: 0.7, num_predict: 131072 },
   ultra: { model: env("OLLAMA_MODEL_ULTRA") || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536 },
+  // Max = strongest general/reasoning model (671B), gated by a per-user daily cap.
+  // Env-overridable so the model can be swapped without a redeploy if Ollama's
+  // cloud catalog rotates. fallbackModel degrades to a known-good hosted model
+  // (gpt-oss) before the last-resort pollinations fallback.
+  max:   { model: env("OLLAMA_MODEL_MAX") || "deepseek-v3.1:671b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: true },
 };
 const OLLAMA_MODEL_VISION = env("OLLAMA_MODEL_VISION") || "qwen2.5vl:7b";
 const MAX_IMAGES_PER_REQUEST = 6;
@@ -281,7 +287,14 @@ function chatStreamResponse(messages, tier, think, vision) {
         const okOllama = await streamOllamaInto(enc, ollamaMessages, tier, think, ac.signal, modelOverride);
         if (!okOllama && !closed) {
           if (vision) { enc(sseFrame("The Firas AI vision engine is offline right now, so I can't view images. Please try again shortly.")); }
-          else { await streamFallbackInto(enc, stripImages(messages), tier, think, ac.signal); }
+          else {
+            // For a capped tier (Max), first degrade to its known-good Ollama
+            // fallback model (gpt-oss) before the last-resort pollinations path.
+            const fb = TIERS[tier] && TIERS[tier].fallbackModel;
+            let recovered = false;
+            if (fb) recovered = await streamOllamaInto(enc, ollamaMessages, tier, think, ac.signal, fb);
+            if (!recovered && !closed) await streamFallbackInto(enc, stripImages(messages), tier, think, ac.signal);
+          }
         }
       } catch (e) {
         if (!ac.signal.aborted) enc(sseFrame("Something went wrong with the Firas AI engine. Please try again."));
@@ -387,6 +400,9 @@ function serverDay(d) { d = d || new Date(); return `${d.getUTCFullYear()}-${Str
 // child key so concurrent distinct-cid charges never clobber each other (no array
 // read-modify-write), and the day naturally "rolls over" since the path is dated.
 async function imgDayNode(userId) { return (await dbGet(`imgQuota/${userId}/${serverDay()}`)) || {}; }
+// Today's charged Max-tier request ids for a user, as { cid: true } — same per-child
+// scheme as images so concurrent distinct charges never clobber each other.
+async function maxDayNode(userId) { return (await dbGet(`maxQuota/${userId}/${serverDay()}`)) || {}; }
 
 /* ============================================================================
    ROUTER
@@ -418,6 +434,18 @@ export default async (request, context) => {
       if (!messages.length) return json({ error: 'body must include a non-empty "messages" array' }, 400);
       const vision = hasImages(messages);
       const think = vision ? false : !!payload.think;
+      // Capped tier (Max): enforce the per-user daily limit and charge one slot per
+      // distinct request id (idempotent on retry of the same cid).
+      if (TIERS[tier] && TIERS[tier].capped) {
+        const day = serverDay();
+        const node = await maxDayNode(user.id);
+        let cid = String(payload.cid || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+        const isNew = !cid || !(cid in node);
+        if (isNew && Object.keys(node).length >= MAX_DAILY_LIMIT) {
+          return json({ error: "daily Max limit reached", limit: MAX_DAILY_LIMIT, used: Object.keys(node).length, remaining: 0 }, 429);
+        }
+        if (isNew) { if (!cid) cid = crypto.randomUUID(); try { await dbPut(`maxQuota/${user.id}/${day}/${cid}`, true); } catch (_) {} }
+      }
       return chatStreamResponse(messages, tier, think, vision);
     }
 
@@ -543,6 +571,15 @@ export default async (request, context) => {
       const used = Object.keys(await imgDayNode(user.id)).length;
       if (used >= IMAGE_DAILY_LIMIT) return json({ ok: false, limit: IMAGE_DAILY_LIMIT, used, remaining: 0 }, 429);
       return json({ ok: true, limit: IMAGE_DAILY_LIMIT, used, remaining: IMAGE_DAILY_LIMIT - used });
+    }
+
+    /* ---- Max tier quota (read-only pre-check) ---- */
+    if (path === "/api/max/quota" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ ok: false, error: "auth required" }, 401);
+      const used = Object.keys(await maxDayNode(user.id)).length;
+      if (used >= MAX_DAILY_LIMIT) return json({ ok: false, limit: MAX_DAILY_LIMIT, used, remaining: 0 }, 429);
+      return json({ ok: true, limit: MAX_DAILY_LIMIT, used, remaining: MAX_DAILY_LIMIT - used });
     }
 
     /* ---- image generation proxy (charge on success by cid) ---- */

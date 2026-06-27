@@ -64,6 +64,11 @@ const TIERS = {
   mini:  { model: process.env.OLLAMA_MODEL_MINI  || "gpt-oss:120b-cloud", temperature: 0.5, num_predict: 16384 },
   pro:   { model: process.env.OLLAMA_MODEL_PRO   || "gpt-oss:120b-cloud", temperature: 0.7, num_predict: 131072 },
   ultra: { model: process.env.OLLAMA_MODEL_ULTRA || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536 },
+  // Max = strongest general/reasoning model (671B), gated by a per-user daily cap.
+  // Env-overridable so the model swaps without a redeploy if Ollama's cloud catalog
+  // rotates. fallbackModel degrades to a known-good hosted model (gpt-oss) before the
+  // last-resort pollinations fallback.
+  max:   { model: process.env.OLLAMA_MODEL_MAX || "deepseek-v3.1:671b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: process.env.OLLAMA_MODEL_MAX_FALLBACK || "gpt-oss:120b-cloud", capped: true },
 };
 
 // Vision/multimodal model — used automatically when a request carries images.
@@ -1065,6 +1070,25 @@ function imgRollDay(user) {
   return false;
 }
 
+// Per-user daily cap for the Max tier (strongest model). Configurable via env.
+const MAX_DAILY_LIMIT = Math.max(1, parseInt(process.env.MAX_DAILY_LIMIT, 10) || 10);
+// Reset the per-day Max-request set when the local day rolls over.
+function maxRollDay(user) {
+  const today = serverDay();
+  if (user.maxDay !== today) { user.maxDay = today; user.maxCids = []; return true; }
+  if (!Array.isArray(user.maxCids)) { user.maxCids = []; return true; }
+  return false;
+}
+/* PRE-CHECK only (read-only): whether the user can still use the Max tier today. */
+async function handleMaxQuota(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { ok: false, error: "auth required" });
+  if (maxRollDay(user)) await persist();
+  const used = user.maxCids.length;
+  if (used >= MAX_DAILY_LIMIT) return sendJson(res, 429, { ok: false, limit: MAX_DAILY_LIMIT, used, remaining: 0 });
+  return sendJson(res, 200, { ok: true, limit: MAX_DAILY_LIMIT, used, remaining: MAX_DAILY_LIMIT - used });
+}
+
 /* PRE-CHECK only (read-only): tells the client whether the user can still create
    an image today. The slot is NOT charged here — it's charged in handleImage
    only when real bytes come back (so failed generations never cost a credit, and
@@ -1239,6 +1263,18 @@ async function handleChat(req, res) {
     return sendJson(res, 400, { error: 'body must include a non-empty "messages" array' });
   }
 
+  // Capped tier (Max): enforce the per-user daily limit and charge one slot per
+  // distinct request id (idempotent on retry of the same cid).
+  if (TIERS[tier] && TIERS[tier].capped) {
+    maxRollDay(user);
+    let cid = String(payload.cid || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    const isNew = !cid || !user.maxCids.includes(cid);
+    if (isNew && user.maxCids.length >= MAX_DAILY_LIMIT) {
+      return sendJson(res, 429, { error: "daily Max limit reached", limit: MAX_DAILY_LIMIT, used: user.maxCids.length, remaining: 0 });
+    }
+    if (isNew) { user.maxCids.push(cid || ("r" + Date.now())); persist(); }
+  }
+
   // VISION DETECTION: any message carrying a non-empty images array routes to
   // the vision model with think forced OFF and RAW base64 images attached.
   const vision = hasImages(messages);
@@ -1263,8 +1299,15 @@ async function handleChat(req, res) {
         sseWrite(res, "The Firas AI vision engine is offline right now, so I can't view images. Please try again shortly.");
         sseDone(res);
       } else {
-        // Ollama unreachable -> resilient TEXT fallback (no bytes streamed yet).
-        await streamFallback(res, messages, tier, think, ac.signal);
+        // For a capped tier (Max), first degrade to its known-good Ollama fallback
+        // model (gpt-oss) before the last-resort pollinations text fallback.
+        const fb = TIERS[tier] && TIERS[tier].fallbackModel;
+        let recovered = false;
+        if (fb) recovered = await streamOllama(res, ollamaMessages, tier, think, ac.signal, fb);
+        if (!recovered && !res.writableEnded) {
+          // Ollama unreachable -> resilient TEXT fallback (no bytes streamed yet).
+          await streamFallback(res, messages, tier, think, ac.signal);
+        }
       }
     }
   } catch (e) {
@@ -1342,6 +1385,9 @@ const server = http.createServer(async (req, res) => {
     // ---- Image generation (keyless, server-proxied pollinations) ----
     if (route === "/api/image/quota" && method === "POST") return await handleImageQuota(req, res);
     if (route === "/api/image" && method === "GET") return await handleImage(req, res);
+
+    // ---- Max tier daily quota (read-only pre-check) ----
+    if (route === "/api/max/quota" && method === "POST") return await handleMaxQuota(req, res);
 
     // ---- Build version (lets an open tab auto-reload when code changes) ----
     if (route === "/api/version" && method === "GET") return handleVersion(req, res);
