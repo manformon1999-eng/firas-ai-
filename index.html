@@ -205,13 +205,12 @@
         <div id="welcome"></div>
       </div>
 
-      <!-- Scroll-to-bottom -->
-      <button class="scroll-bottom" id="scrollBottomBtn" aria-label="Scroll to latest">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
-      </button>
-
       <!-- Composer -->
       <div class="composer-wrap">
+        <!-- Scroll-to-bottom: anchored just above the composer on every device -->
+        <button class="scroll-bottom" id="scrollBottomBtn" aria-label="Scroll to latest">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+        </button>
         <form class="composer" id="composer">
           <div class="attach-tray" id="attachTray" aria-label="Attached images"></div>
           <input type="file" id="fileInput" accept="image/*" multiple hidden />

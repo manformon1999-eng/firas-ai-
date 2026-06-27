@@ -458,6 +458,44 @@ h1, h2, h3 { margin: 0; font-family: var(--font-serif); font-weight: var(--weigh
 }
 .tier-switch__btn[data-tier="ultra"].is-active .tier-name::before { background: var(--color-accent); }
 
+/* Max gets a PURPLE node dot + a premium glow when active */
+.tier-switch__btn[data-tier="max"] .tier-name::before {
+  content: ""; display: inline-block;
+  inline-size: 6px; block-size: 6px; margin-inline-end: 6px;
+  border-radius: var(--radius-pill); background: #8b5cf6; vertical-align: 1px;
+}
+.tier-switch__btn[data-tier="max"]:hover { color: #7c3aed; }
+.tier-switch__btn[data-tier="max"].is-active {
+  background: rgba(139, 92, 246, 0.13);
+  color: #7c3aed; font-weight: var(--weight-semibold); box-shadow: none;
+}
+.tier-switch__btn[data-tier="max"].is-active .tier-name::before {
+  background: #8b5cf6; animation: maxDotPulse 1.8s ease-in-out infinite;
+}
+@keyframes maxDotPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.5); }
+  50%      { box-shadow: 0 0 0 5px rgba(139, 92, 246, 0); }
+}
+
+/* Professional "switch" pop on whichever tier was just activated */
+.tier-switch__btn.just-activated { animation: tierPop 0.42s var(--ease-out); }
+@keyframes tierPop {
+  0%   { transform: scale(0.9); }
+  45%  { transform: scale(1.07); }
+  100% { transform: scale(1); }
+}
+.tier-switch__btn[data-tier="max"].just-activated {
+  animation: tierPop 0.42s var(--ease-out), maxGlow 0.65s var(--ease-out);
+}
+@keyframes maxGlow {
+  0%   { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0.55); }
+  100% { box-shadow: 0 0 0 16px rgba(139, 92, 246, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tier-switch__btn.just-activated,
+  .tier-switch__btn[data-tier="max"].is-active .tier-name::before { animation: none; }
+}
+
 /* Icon button */
 .icon-btn {
   display: grid; place-items: center;
@@ -1105,7 +1143,7 @@ h1, h2, h3 { margin: 0; font-family: var(--font-serif); font-weight: var(--weigh
 
 /* Scroll-to-bottom */
 .scroll-bottom {
-  position: absolute; inset-block-end: 124px; inset-inline-start: 50%;
+  position: absolute; inset-block-end: calc(100% + 10px); inset-inline-start: 50%;
   transform: translateX(-50%) translateY(6px);
   inline-size: 36px; block-size: 36px; border-radius: var(--radius-pill);
   display: grid; place-items: center;

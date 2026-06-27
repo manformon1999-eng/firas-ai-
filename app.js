@@ -1893,12 +1893,20 @@ function buildTierSwitch() {
 }
 function setTier(key) {
   if (!MODELS[key]) return;
+  const changed = state.tier !== key;
   state.tier = key;
   localStorage.setItem(LS_TIER, key);
   els.tierSwitch.querySelectorAll(".tier-switch__btn").forEach((b) => {
     const on = b.dataset.tier === key;
     b.classList.toggle("is-active", on);
     b.setAttribute("aria-selected", on ? "true" : "false");
+    if (on && changed) {
+      // Replay the professional "switch" pop/glow on the newly-selected tier.
+      b.classList.remove("just-activated");
+      void b.offsetWidth; // force reflow so the animation restarts every switch
+      b.classList.add("just-activated");
+      setTimeout(() => b.classList.remove("just-activated"), 700);
+    }
   });
 }
 
@@ -4055,8 +4063,12 @@ function plannerSys(fmt, lang) {
     AGENT_THEMES + " No preamble, no commentary." + agentBrand(lang);
 }
 function authorSys(fmt, lang) {
-  const mathRule = " Write every equation/formula as $$ … $$ (display) or $ … $ (inline) Markdown so it renders — " +
-    "NEVER inside a code block, NEVER \\documentclass/\\begin{document}, NEVER tell the user to compile or use Overleaf.";
+  const mathRule = " Render ALL mathematics with real LaTeX inside $ … $ (inline) or $$ … $$ (display) so it typesets " +
+    "beautifully (like KaTeX) — use proper notation: \\frac, \\sqrt, ^{}, _{}, \\int, \\sum, \\prod, \\lim, Greek letters, " +
+    "vectors/matrices via \\begin{matrix}…\\end{matrix} or \\begin{bmatrix}…, multi-line derivations via " +
+    "\\begin{aligned}…\\end{aligned}, and piecewise via \\begin{cases}…\\end{cases}. Present each result cleanly and " +
+    "professionally, define symbols, and show key steps. NEVER put math in a code block, NEVER use \\documentclass or " +
+    "\\begin{document}, and NEVER tell the user to compile or use Overleaf.";
   if (fmt === "xlsx" || fmt === "csv") return "You are an expert data author. Following the plan, output the data as clean " +
     "GitHub-style Markdown tables, each preceded by a '## Table Name' heading; plain numbers in numeric cells. Only the " +
     "content — no metadata block, no preamble, no code." + agentBrand(lang);
@@ -4728,6 +4740,14 @@ async function streamAnswer(aiMsg, aiNode, chat) {
         ? "أنت ترى الصورة/الصور المرفقة. إن طُلب منك استخراج أو نسخ أو قراءة النص من الصورة، فاكتب كل النص كاملًا وحرفيًا — كل عنوان وفقرة وسطر ونقطة بالترتيب — دون تلخيص أو اختصار أو توقّف مبكّر، إلى آخر كلمة في الصفحة. وإلا فأجب عن السؤال المتعلّق بالصورة بدقّة وتفصيل."
         : "You can see the attached image(s). If asked to extract, transcribe, or read text from the image, output ALL the text COMPLETELY and verbatim — every heading, paragraph, line and bullet, in order — never summarize, abbreviate, or stop early; continue to the very last word on the page. Otherwise answer the question about the image accurately and in detail.";
       requestMessages = [requestMessages[0], { role: "system", content: vSys }, ...requestMessages.slice(1)];
+    }
+    // MAX tier → push maximum reasoning depth: decompose, explore approaches, reason
+    // rigorously step-by-step, weigh edge-cases, and self-verify before answering.
+    if (requestTier === "max") {
+      const maxSys = replyLang === "ar"
+        ? "أنت الآن في الوضع الأقوى «ماكس». تعامل مع المسألة بأقصى عمق وذكاء: فكّك المشكلة إلى مكوّناتها، استكشف أكثر من زاوية ونهج قبل أن تقرّر، استنتج خطوةً بخطوة بدقّة صارمة، وازِن الحالات الحدّية والفروق الدقيقة والمقايضات صراحةً، وتحقّق من صحّة إجابتك ذاتيًا قبل تقديمها. قدّم تحليلًا شاملًا ومنظَّمًا ودقيقًا وعالي الجودة — أعمق وأذكى بكثير من رد عادي."
+        : "You are now in the most powerful mode, 'Max'. Engage with maximum depth and intelligence: decompose the problem into its parts, explore multiple angles and approaches before deciding, reason step by step with rigorous precision, weigh edge-cases, nuances and trade-offs explicitly, and self-verify your answer before giving it. Deliver a thorough, well-structured, precise, top-quality analysis — far deeper and smarter than an ordinary reply.";
+      requestMessages = [requestMessages[0], { role: "system", content: maxSys }, ...requestMessages.slice(1)];
     }
     const rtModel = MODELS[requestTier] || tier;
 
