@@ -1111,6 +1111,9 @@ function codeSystemPrompt(spec) {
     spec.lang === "html"
       ? "- For HTML: put ALL HTML, CSS and JavaScript INSIDE this one file (inline <style> and <script>). Do NOT reference external files or CDN libraries unless the user explicitly asks. No frameworks (Bootstrap/Tailwind/React) unless requested."
       : "- Keep everything in this single file; avoid external dependencies unless the user explicitly asks.",
+    spec.lang === "html"
+      ? "- BUILD IN ORDER and BUDGET your output so you REACH THE END: <head> + a FOCUSED <style> (only the CSS the sections actually need — do NOT over-expand or pad the CSS), then the COMPLETE <body> with EVERY section, then <script>, then </html>. The document MUST end with </html>. NEVER spend your whole budget on CSS and stop before the <body>."
+      : "- Structure the file so it is COMPLETE and ends properly with every block/function closed.",
     "- Write clean, well-organized, professional code with helpful comments and consistent formatting.",
     "- Follow EVERY requirement in the user's request precisely. Prefer more complete over shorter.",
     "- Begin your response immediately with the first character of the code (e.g. <!DOCTYPE html>).",
@@ -4124,25 +4127,52 @@ function codeContinueUserMsg(meta, ar) {
     : `This ${lbl} file stopped before completing and is INCOMPLETE. Continue from exactly where it stops and finish it fully (close every tag/bracket; for HTML complete <style>, </head>, the full <body> and scripts, and end with </html>). Output ONLY the remaining raw code, never re-output an existing line, no commentary or \`\`\` fences.`;
 }
 
+/** STATE-AWARE next-step hint: tell the model exactly which PART of the file is
+    still missing, so each round advances the build instead of re-doing CSS. */
+function codeProgressHint(code, lang) {
+  const s = String(code || "");
+  const isHtml = lang === "html" || /<!doctype html|<html[\s>]/i.test(s);
+  if (!isHtml) return "";
+  if (/<\/html>\s*$/i.test(s)) return "";
+  const hasStyleClose = /<\/style>/i.test(s);
+  const hasBodyOpen = /<body[\s>]/i.test(s);
+  const bodyInner = hasBodyOpen ? (s.split(/<body[^>]*>/i)[1] || "") : "";
+  const hasBodyClose = /<\/body>/i.test(s);
+  if (!hasStyleClose) return "Wrap up the CSS now (do NOT add more selectors), close </style></head>, then write the COMPLETE <body> with every section, then <script>, then </html>.";
+  if (!hasBodyOpen || bodyInner.replace(/\s/g, "").length < 60) return "The CSS is finished. Now write the FULL <body> markup for ALL sections (header, hero, the main content sections, footer), then any <script>, then end with </html>.";
+  if (!hasBodyClose) return "Continue the <body> with the remaining sections, then add the scripts, then close </body> and end with </html>.";
+  return "Add any remaining <script> and end the document with </html>.";
+}
+
 /** AUTO-COMPLETE: keep continuing a cut-off file until it's whole — so ONE request
-    can yield a large COMPLETE file with no manual clicking. Loops the continuation
-    (coder model) until codeLooksComplete, no growth, the round cap, or Stop. Calls
-    onChunk(mergedCode, round) so the caller streams the growth live. Returns the
-    final code. `convo` = the conversation up to (not incl.) this reply. */
+    yields a large COMPLETE file (10k+ lines) with no manual clicking and no errors.
+    Genius bits: (a) each round gets a STATE-AWARE hint of what's still missing so the
+    model advances instead of re-doing CSS; (b) for huge files the context is BOUNDED
+    to head+tail (not the whole file) so it scales without bloat/restarts; (c) a
+    no-progress STREAK guard + caps prevent runaway. Calls onChunk(mergedCode, round)
+    to stream the growth live. `convo` = conversation up to (not incl.) this reply. */
 async function autoCompleteCode(code, codeReq, convo, lang, signal, onChunk) {
-  const MAX_ROUNDS = 8, MAX_LEN = 500000;
+  const MAX_ROUNDS = 16, MAX_LEN = 900000, CTX_BUDGET = 140000;
   const ar = lang === "ar";
+  let dry = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     if (signal.aborted || code.length > MAX_LEN || codeLooksComplete(code, codeReq.lang)) break;
+    // Bound the context for huge files: send the head (structure) + the tail (where
+    // to continue), not the whole file — this is what lets it scale past 10k lines.
+    let ctx = code;
+    if (code.length > CTX_BUDGET) {
+      ctx = code.slice(0, 2000) + "\n\n/* …earlier code already written (omitted)… */\n\n" + code.slice(code.length - (CTX_BUDGET - 2000));
+    }
     const prior = convo.map((m) => {
-      if (m.role === "assistant") { const cm = parseCodeMeta(m.content); if (cm) return { role: "assistant", content: cleanCodeBody(cm.code) }; }
+      if (m.role === "assistant") { const cm = parseCodeMeta(m.content); if (cm) return { role: "assistant", content: cleanCodeBody(cm.code).slice(-4000) }; }
       return { role: m.role, content: m.content };
     }).filter((m) => m.content && (m.role === "user" || m.role === "assistant"));
+    const hint = codeProgressHint(code, codeReq.lang);
     const messages = [
       { role: "system", content: codeContinueSystemPrompt(codeReq) },
       ...prior,
-      { role: "assistant", content: code },
-      { role: "user", content: codeContinueUserMsg(codeReq, ar) },
+      { role: "assistant", content: ctx },
+      { role: "user", content: codeContinueUserMsg(codeReq, ar) + (hint ? ("\n\n" + (ar ? "الخطوة التالية المطلوبة: " : "Required next step: ") + hint) : "") },
     ];
     const before = code;
     let out = "";
@@ -4152,7 +4182,8 @@ async function autoCompleteCode(code, codeReq, convo, lang, signal, onChunk) {
       });
     } catch (e) { break; } // network/abort → stop auto-completing, keep what we have
     const merged = joinCodeContinuation(before, sanitizeContinuation(out));
-    if (merged.length <= before.length + 8) break; // no real progress → stop
+    if (merged.length <= before.length + 8) { if (++dry >= 2) break; continue; } // no progress (allow one retry)
+    dry = 0;
     code = merged;
     if (onChunk) onChunk(code, round);
   }
