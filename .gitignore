@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Local tunnel tool (54MB binary — not part of the app)
+cloudflared.exe
+
 # Secrets — never commit real keys
 .env
 .env.local

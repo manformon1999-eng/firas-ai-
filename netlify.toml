@@ -1,0 +1,17 @@
+# Netlify config for the Firas AI EDGE version.
+# The static frontend (index.html / app.js / styles.css / firebase-config.js) is
+# served from the repo root; ONE edge function owns all /api/* routes
+# (netlify/edge-functions/api.js). The original server.mjs is unused by Netlify —
+# this deploy is driven entirely by the edge function + static files.
+
+[build]
+  publish = "."
+  command = ""            # no build step (vanilla, zero-dependency frontend)
+
+[[edge_functions]]
+  path = "/api/*"
+  function = "api"
+
+# Static files serve automatically for every non-/api path — all routes are real
+# files (/, /index.html, /app.js, /styles.css, /firebase-config.js). The edge
+# function intercepts every /api/* request and returns 404 for unknown api paths.
