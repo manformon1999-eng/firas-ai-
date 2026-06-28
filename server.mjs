@@ -66,11 +66,12 @@ const OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions";
 // pollinations on error/quota. Free key, NO credit card (aistudio.google.com).
 const GEMINI_API_KEY     = process.env.GEMINI_API_KEY || "";
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image";
-// Hugging Face image model (FLUX.1-dev = stronger than keyless flux-schnell). Free
-// token, no card. If HF_API_KEY is set, /api/image tries it after Gemini, before
-// keyless pollinations. HF_IMAGE_URL overrides the endpoint if HF changes routing.
+// Hugging Face image model. Only FLUX.1-schnell is still served FREE by hf-inference
+// (FLUX.1-dev/SDXL/SD3.5 now 410/400 — need a paid provider). Lossless PNG, but not
+// clearly better than keyless pollinations. If HF_API_KEY is set, /api/image tries it
+// after Gemini, before keyless pollinations. HF_IMAGE_URL overrides the endpoint.
 const HF_API_KEY     = process.env.HF_API_KEY || "";
-const HF_IMAGE_MODEL = process.env.HF_IMAGE_MODEL || "black-forest-labs/FLUX.1-dev";
+const HF_IMAGE_MODEL = process.env.HF_IMAGE_MODEL || "black-forest-labs/FLUX.1-schnell";
 const HF_IMAGE_URL   = process.env.HF_IMAGE_URL || ("https://router.huggingface.co/hf-inference/models/" + HF_IMAGE_MODEL);
 
 // Tier -> Ollama model + generation params (env-overridable).
@@ -1158,7 +1159,7 @@ async function generateImageGemini(prompt) {
   finally { clearTimeout(to); }
 }
 
-// Generate an image with Hugging Face (FLUX.1-dev). Returns {buf, mime} or null.
+// Generate an image with Hugging Face (FLUX.1-schnell). Returns {buf, mime} or null.
 async function generateImageHF(prompt) {
   if (!HF_API_KEY) return null;
   const ac = new AbortController();
@@ -1210,7 +1211,7 @@ async function handleImage(req, res) {
     }
     if (GEMINI_API_KEY) console.error("[firas] Gemini returned no image → next engine");
   } catch (_) { if (GEMINI_API_KEY) console.error("[firas] Gemini error → next engine"); }
-  // 1b) Hugging Face FLUX.1-dev (free token) → stronger than keyless flux-schnell.
+  // 1b) Hugging Face FLUX.1-schnell (free token) → lossless PNG; ~on par with keyless.
   try {
     const hf = await generateImageHF(prompt);
     if (hf && hf.buf && hf.buf.length) {

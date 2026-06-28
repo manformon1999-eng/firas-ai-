@@ -30,9 +30,9 @@ const OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions";
 // /api/image uses it FIRST, falling back to keyless pollinations. Free key, no card.
 const GEMINI_API_KEY     = env("GEMINI_API_KEY") || "";
 const GEMINI_IMAGE_MODEL = env("GEMINI_IMAGE_MODEL") || "gemini-2.5-flash-image";
-// Hugging Face image model (FLUX.1-dev) — free token, stronger than keyless flux.
+// Hugging Face image model — only FLUX.1-schnell is still free (dev/SDXL/SD3.5 = 410/400).
 const HF_API_KEY     = env("HF_API_KEY") || "";
-const HF_IMAGE_MODEL = env("HF_IMAGE_MODEL") || "black-forest-labs/FLUX.1-dev";
+const HF_IMAGE_MODEL = env("HF_IMAGE_MODEL") || "black-forest-labs/FLUX.1-schnell";
 const HF_IMAGE_URL   = env("HF_IMAGE_URL") || ("https://router.huggingface.co/hf-inference/models/" + HF_IMAGE_MODEL);
 const UPSTREAM_TIMEOUT_MS = Number(env("REQUEST_TIMEOUT_MS")) || 300000;
 
@@ -529,7 +529,7 @@ async function generateImageGemini(prompt) {
   finally { clearTimeout(to); }
 }
 
-// Generate an image with Hugging Face (FLUX.1-dev). Returns {bytes, mime} or null.
+// Generate an image with Hugging Face (FLUX.1-schnell). Returns {bytes, mime} or null.
 async function generateImageHF(prompt) {
   if (!HF_API_KEY) return null;
   const ac = new AbortController();
@@ -751,7 +751,7 @@ export default async (request, context) => {
           return new Response(gem.bytes, { headers: { "Content-Type": gem.mime, "Cache-Control": "public, max-age=86400" } });
         }
       } catch (_) { /* fall through */ }
-      // Hugging Face FLUX.1-dev (free token) → stronger than keyless flux-schnell.
+      // Hugging Face FLUX.1-schnell (free token) → lossless PNG; ~on par with keyless.
       try {
         const hf = await generateImageHF(prompt);
         if (hf && hf.bytes && hf.bytes.length) {
