@@ -66,6 +66,12 @@ const OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions";
 // pollinations on error/quota. Free key, NO credit card (aistudio.google.com).
 const GEMINI_API_KEY     = process.env.GEMINI_API_KEY || "";
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image";
+// Hugging Face image model (FLUX.1-dev = stronger than keyless flux-schnell). Free
+// token, no card. If HF_API_KEY is set, /api/image tries it after Gemini, before
+// keyless pollinations. HF_IMAGE_URL overrides the endpoint if HF changes routing.
+const HF_API_KEY     = process.env.HF_API_KEY || "";
+const HF_IMAGE_MODEL = process.env.HF_IMAGE_MODEL || "black-forest-labs/FLUX.1-dev";
+const HF_IMAGE_URL   = process.env.HF_IMAGE_URL || ("https://router.huggingface.co/hf-inference/models/" + HF_IMAGE_MODEL);
 
 // Tier -> Ollama model + generation params (env-overridable).
 // num_predict = MAX output tokens. Generous so long outputs (a full single-file
@@ -1152,6 +1158,27 @@ async function generateImageGemini(prompt) {
   finally { clearTimeout(to); }
 }
 
+// Generate an image with Hugging Face (FLUX.1-dev). Returns {buf, mime} or null.
+async function generateImageHF(prompt) {
+  if (!HF_API_KEY) return null;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 60_000);
+  try {
+    const r = await fetch(HF_IMAGE_URL, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + HF_API_KEY, "Content-Type": "application/json", "Accept": "image/png" },
+      body: JSON.stringify({ inputs: String(prompt || "").slice(0, 2000) }),
+      signal: ac.signal,
+    });
+    if (!r.ok) { console.error("[firas] HF image HTTP " + r.status + ": " + (await r.text().catch(() => "")).slice(0, 160)); return null; }
+    const ct = r.headers.get("content-type") || "";
+    if (!ct.startsWith("image/")) { console.error("[firas] HF non-image response (" + ct + ")"); return null; }
+    const buf = Buffer.from(await r.arrayBuffer());
+    return buf.length ? { buf, mime: ct } : null;
+  } catch (_) { return null; }
+  finally { clearTimeout(to); }
+}
+
 async function handleImage(req, res) {
   // Require a session so the proxy can't be used as an anonymous, unmetered relay
   // to pollinations. Authed reloads of saved images still carry the cookie, so
@@ -1181,8 +1208,18 @@ async function handleImage(req, res) {
       res.writeHead(200, { "Content-Type": gem.mime, "Cache-Control": "public, max-age=86400" });
       return res.end(gem.buf);
     }
-    if (GEMINI_API_KEY) console.error("[firas] Gemini returned no image → pollinations fallback");
-  } catch (_) { if (GEMINI_API_KEY) console.error("[firas] Gemini error → pollinations fallback"); }
+    if (GEMINI_API_KEY) console.error("[firas] Gemini returned no image → next engine");
+  } catch (_) { if (GEMINI_API_KEY) console.error("[firas] Gemini error → next engine"); }
+  // 1b) Hugging Face FLUX.1-dev (free token) → stronger than keyless flux-schnell.
+  try {
+    const hf = await generateImageHF(prompt);
+    if (hf && hf.buf && hf.buf.length) {
+      console.log("[firas] image served by Hugging Face (" + HF_IMAGE_MODEL + ")");
+      if (isNew) { user.imgCids.push(cid); persist(); }
+      res.writeHead(200, { "Content-Type": hf.mime, "Cache-Control": "public, max-age=86400" });
+      return res.end(hf.buf);
+    }
+  } catch (_) { /* fall through to pollinations */ }
   // 2) Keyless pollinations (flux) with LLM prompt-enhance + private/no-feed for the
   // best free quality (enhance≈doubles detail; private+nofeed keep it off the feed).
   const src = "https://image.pollinations.ai/prompt/" + encodeURIComponent(prompt) +
