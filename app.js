@@ -843,6 +843,10 @@ function serializeMessages(messages) {
     if (Array.isArray(m.imageThumbs) && m.imageThumbs.length) {
       out.imageThumbs = m.imageThumbs;
     }
+    // Persist attached-file chips (names only) — NOT the extracted fileText (lean history).
+    if (Array.isArray(m.files) && m.files.length) {
+      out.files = m.files;
+    }
     return out;
   });
 }
@@ -2304,6 +2308,27 @@ function userTurnEl(msg) {
       gallery.appendChild(img);
     });
     bubble.appendChild(gallery);
+  }
+
+  // Attached document chips (PDF / code / text)
+  const fileChips = Array.isArray(msg.files) ? msg.files : [];
+  if (fileChips.length) {
+    const wrap = document.createElement("div");
+    wrap.className = "msg-user__files";
+    wrap.dir = "ltr";
+    fileChips.forEach((f) => {
+      const chip = document.createElement("span");
+      chip.className = "msg-file-chip";
+      const ic = document.createElement("span");
+      ic.className = "msg-file-chip__ic";
+      ic.textContent = f.kind === "pdf" ? "PDF" : "TXT";
+      const nm = document.createElement("span");
+      nm.className = "msg-file-chip__nm";
+      nm.textContent = f.name || "file";
+      chip.appendChild(ic); chip.appendChild(nm);
+      wrap.appendChild(chip);
+    });
+    bubble.appendChild(wrap);
   }
 
   if (msg.content) {
@@ -3769,7 +3794,46 @@ const MAX_IMAGES = 4;
 const MAX_EDGE = 1568;       // longest edge sent to the vision model
 const THUMB_EDGE = 256;      // tiny thumb persisted to history
 let pendingImages = [];
-let readingImages = 0;       // >0 while files are being processed (disable send)
+let readingImages = 0;       // >0 while ANY attachment (image/doc) is being processed (disables send)
+
+/* ---- Document attachments (PDF / code / text) — read to text, sent as context ---- */
+let pendingFiles = [];       // [{ id, name, kind:'pdf'|'code', text, loading }]
+const MAX_FILES = 5;
+const MAX_FILE_CHARS = 120000;        // per-file extracted-text cap
+const MAX_TOTAL_FILE_CHARS = 300000;  // total across all attached files
+const CODE_EXT = /\.(txt|md|markdown|csv|tsv|json|jsonl|xml|yml|yaml|html?|css|scss|less|js|jsx|mjs|cjs|ts|tsx|py|java|c|h|cpp|cc|hpp|cs|go|rs|rb|php|swift|kt|kts|sql|sh|bash|zsh|ini|toml|env|cfg|conf|log|tex|srt|vtt|rtf|svg)$/i;
+function isPdfFile(file) { return file.type === "application/pdf" || /\.pdf$/i.test(file.name || ""); }
+function isTextFile(file) {
+  return (file.type && (file.type.startsWith("text/") || /(json|xml|javascript|typescript|csv|yaml|x-sh|x-python)/i.test(file.type))) || CODE_EXT.test(file.name || "");
+}
+/** Lazy-load pdf.js (CDN) once, for in-browser PDF text extraction. */
+let _pdfjsPromise = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (_pdfjsPromise) return _pdfjsPromise;
+  _pdfjsPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = () => { try { window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"; } catch (_) {} resolve(window.pdfjsLib); };
+    s.onerror = () => { _pdfjsPromise = null; reject(new Error("pdfjs")); };
+    document.head.appendChild(s);
+  });
+  return _pdfjsPromise;
+}
+async function extractPdfText(file) {
+  const pdfjs = await loadPdfJs();
+  const data = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data }).promise;
+  let text = "";
+  const pages = Math.min(pdf.numPages, 60);
+  for (let i = 1; i <= pages; i++) {
+    const page = await pdf.getPage(i);
+    const tc = await page.getTextContent();
+    text += tc.items.map((it) => it.str).join(" ") + "\n\n";
+    if (text.length > MAX_FILE_CHARS) break;
+  }
+  return text.trim();
+}
 
 /** Load a File into an HTMLImageElement (off the main render path). */
 function fileToImage(file) {
@@ -3802,9 +3866,51 @@ function rawBase64(dataUrl) {
   return i >= 0 ? dataUrl.slice(i + 1) : dataUrl;
 }
 
+/** Dispatch attached files: images → vision tray; PDF/code/text → document tray. */
 async function handleFiles(fileList) {
-  const files = Array.from(fileList || []).filter((f) => f.type.startsWith("image/"));
-  if (!files.length) return;
+  const all = Array.from(fileList || []);
+  const images = all.filter((f) => f.type.startsWith("image/"));
+  const docs = all.filter((f) => !f.type.startsWith("image/") && (isPdfFile(f) || isTextFile(f)));
+  const bad = all.filter((f) => !f.type.startsWith("image/") && !isPdfFile(f) && !isTextFile(f));
+  if (bad.length) showToast(state.lang === "ar" ? "نوع ملف غير مدعوم" : "Unsupported file type");
+  if (images.length) await handleImageFiles(images);
+  if (docs.length) await handleDocFiles(docs);
+}
+
+/** Read PDF/code/text files to plain text and stage them as message context. */
+async function handleDocFiles(files) {
+  for (const file of files) {
+    if (pendingFiles.length >= MAX_FILES) {
+      showToast(state.lang === "ar" ? `الحد الأقصى ${MAX_FILES} ملفات` : `Max ${MAX_FILES} files`);
+      break;
+    }
+    const used = pendingFiles.reduce((n, f) => n + (f.text ? f.text.length : 0), 0);
+    if (used >= MAX_TOTAL_FILE_CHARS) { showToast(state.lang === "ar" ? "حجم الملفات كبير جداً" : "Files too large"); break; }
+    const id = uid();
+    const kind = isPdfFile(file) ? "pdf" : "code";
+    pendingFiles.push({ id, name: (file.name || (kind === "pdf" ? "document.pdf" : "file.txt")).slice(0, 80), kind, text: "", loading: true });
+    renderAttachTray(); readingImages++; updateSendState();
+    try {
+      let text = isPdfFile(file) ? await extractPdfText(file) : await file.text();
+      text = String(text || "").slice(0, Math.min(MAX_FILE_CHARS, Math.max(0, MAX_TOTAL_FILE_CHARS - used)));
+      const item = pendingFiles.find((p) => p.id === id);
+      if (!text.trim()) {
+        pendingFiles = pendingFiles.filter((p) => p.id !== id);
+        showToast(state.lang === "ar" ? "ما كدرت أقرأ نص من الملف" : "No readable text in file");
+      } else if (item) { item.text = text; item.loading = false; }
+    } catch (_) {
+      pendingFiles = pendingFiles.filter((p) => p.id !== id);
+      showToast(state.lang === "ar" ? "تعذّر قراءة الملف" : "Couldn't read file");
+    } finally { readingImages--; renderAttachTray(); updateSendState(); }
+  }
+}
+
+function removePendingFile(id) {
+  pendingFiles = pendingFiles.filter((p) => p.id !== id);
+  renderAttachTray(); updateSendState();
+}
+
+async function handleImageFiles(files) {
   for (const file of files) {
     if (pendingImages.length >= MAX_IMAGES) {
       showToast(state.lang === "ar" ? `الحد الأقصى ${MAX_IMAGES} صور` : `Max ${MAX_IMAGES} images`);
@@ -3844,6 +3950,7 @@ function removePendingImage(id) {
 
 function clearPendingImages() {
   pendingImages = [];
+  pendingFiles = [];
   renderAttachTray();
 }
 
@@ -3868,6 +3975,25 @@ function renderAttachTray() {
     cell.appendChild(rm);
     tray.appendChild(cell);
   });
+  pendingFiles.forEach((p) => {
+    const cell = document.createElement("div");
+    cell.className = "attach-file" + (p.loading ? " is-loading" : "");
+    const icon = document.createElement("span");
+    icon.className = "attach-file__icon";
+    icon.textContent = p.kind === "pdf" ? "PDF" : "TXT";
+    const name = document.createElement("span");
+    name.className = "attach-file__name";
+    name.textContent = p.loading ? (state.lang === "ar" ? "...قراءة" : "reading…") : p.name;
+    cell.appendChild(icon); cell.appendChild(name);
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "attach-thumb__remove";
+    rm.setAttribute("aria-label", t().delete);
+    rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+    rm.addEventListener("click", () => removePendingFile(p.id));
+    cell.appendChild(rm);
+    tray.appendChild(cell);
+  });
 }
 
 /* ----------------------------------------------------------------------------
@@ -3887,8 +4013,9 @@ function updateSendState() {
   if (state.streaming) return;
   const hasText = els.input.value.trim().length > 0;
   const hasReadyImage = pendingImages.some((p) => !p.loading && p.full);
-  // Disable while images are still being processed (never freeze, but no half-sends).
-  els.sendBtn.disabled = readingImages > 0 || (!hasText && !hasReadyImage);
+  const hasReadyFile = pendingFiles.some((p) => !p.loading && p.text);
+  // Disable while attachments are still being processed (never freeze, but no half-sends).
+  els.sendBtn.disabled = readingImages > 0 || (!hasText && !hasReadyImage && !hasReadyFile);
 }
 
 /* ----------------------------------------------------------------------------
@@ -3999,7 +4126,11 @@ function buildMessages(tier, conversation, replyLang) {
   const fileTurnSystem = fileFmt ? { role: "system", content: fileGuidance(fileFmt) } : null;
 
   const history = conversation.map((m) => {
-    const turn = { role: m.role, content: m.content };
+    // Attached file text (PDF/code/text) is prepended to the user content so the
+    // model can read it; it lives only on the live in-memory message (not persisted).
+    let content = m.content;
+    if (m.role === "user" && m.fileText) content = m.fileText + (content ? "\n\n" + content : "");
+    const turn = { role: m.role, content };
     // Carry images on the user turn so the backend routes to the vision model.
     if (m.role === "user" && Array.isArray(m.images) && m.images.length) {
       turn.images = m.images; // RAW base64 (no data-URL prefix)
@@ -5154,12 +5285,15 @@ function stopStreaming() {
 async function sendMessage() {
   const text = els.input.value.trim();
   const ready = pendingImages.filter((p) => !p.loading && p.full);
+  const readyFiles = pendingFiles.filter((p) => !p.loading && p.text);
   // Block only when the ACTIVE chat is already streaming (a different chat may be
   // streaming in the background — that's fine and must not be interrupted).
-  if ((!text && !ready.length) || activeChatIsStreaming() || readingImages > 0) return;
+  if ((!text && !ready.length && !readyFiles.length) || activeChatIsStreaming() || readingImages > 0) return;
 
   const lang = detectLang(text || "");
-  const chat = ensureActiveChat(text || (lang === "ar" ? "صورة" : "Image"));
+  const attachLabel = ready.length ? (lang === "ar" ? "صورة" : "Image")
+    : (readyFiles.length ? readyFiles[0].name : (lang === "ar" ? "صورة" : "Image"));
+  const chat = ensureActiveChat(text || attachLabel);
 
   // Push user message (images: full raw b64 for the live request only;
   // imageThumbs: small data-URLs kept for rendering + lean persistence).
@@ -5168,10 +5302,17 @@ async function sendMessage() {
     userMsg.images = ready.map((p) => p.full.b64);          // RAW base64, no prefix
     userMsg.imageThumbs = ready.map((p) => p.thumb);         // small data-URLs
   }
+  if (readyFiles.length) {
+    // fileText = the attached content sent to the model (this request only, like raw
+    // images); files = lightweight {name,kind} chips kept for rendering + persistence.
+    userMsg.fileText = "The user attached the following file(s) — read them carefully and use them to answer.\n\n" +
+      readyFiles.map((f) => "===== FILE: " + f.name + " =====\n" + f.text + "\n===== END FILE: " + f.name + " =====").join("\n\n");
+    userMsg.files = readyFiles.map((f) => ({ name: f.name, kind: f.kind }));
+  }
   chat.messages.push(userMsg);
   chat.updatedAt = Date.now();
   if (chat.messages.filter((m) => m.role === "user").length === 1) {
-    chat.title = titleFrom(text || (lang === "ar" ? "صورة" : "Image"));
+    chat.title = titleFrom(text || attachLabel);
   }
 
   // Reset composer + clear attachment tray
