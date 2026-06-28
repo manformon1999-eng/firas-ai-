@@ -630,6 +630,12 @@ function detectFileRequest(text) {
     /(معنى|تعريف|الفرق\s*بين|اشرح|وضّح|فسّر)/.test(s) ||
     /\b(what|how|why|who|when|where|which|whose|meaning|explain|describe|difference\s+between)\b/i.test(s);
 
+  // 0) An EXPLICIT pdf output request ("pdf book/file", "as pdf", "في صيغة pdf") wins
+  //    over any incidental sheet/table/word/slide mention elsewhere in the prompt.
+  if ((hasVerb || !isQuestion) &&
+      /\bpdf\s+(?:book|file|document|workbook|format|report)\b|\b(?:as|in|to|into)\s+(?:an?\s+)?pdf\b|بصيغة\s*pdf|كملف\s*pdf|ملف\s*pdf|بي\s*دي\s*اف/i.test(s)) {
+    return "pdf";
+  }
   // 1) Unambiguous format word = a file request, unless it's a pure question
   //    with no request verb.
   for (const f of formats) {
