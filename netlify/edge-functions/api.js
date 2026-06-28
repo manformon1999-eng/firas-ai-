@@ -337,9 +337,9 @@ async function memoryLearn(user, userText, aiText) {
   const u = 'The USER said: "' + userText + '". Return JSON array of facts:';
   const msgs = [{ role: "system", content: sys }, { role: "user", content: u }];
   const collected = new Map();
-  const temps = [0, 0.5, 0.8]; // vary temperature so passes differ → fuller union
-  for (let a = 0; a < temps.length; a++) {
-    const out = await llmComplete(msgs, 1500, temps[a]);
+  const temps = [0, 0.5, 0.8]; // varied temps → fuller union; run in PARALLEL for speed
+  const outs = await Promise.all(temps.map((t) => llmComplete(msgs, 1500, t)));
+  for (const out of outs) {
     let arr = []; try { const mm = out.match(/\[[\s\S]*\]/); if (mm) arr = JSON.parse(mm[0]); } catch (_) {}
     if (Array.isArray(arr)) for (const f of arr) { const s = String(f || "").trim(); if (s && s.length <= 140) { const k = s.toLowerCase(); if (!collected.has(k)) collected.set(k, s); } }
   }

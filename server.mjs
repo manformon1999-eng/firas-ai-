@@ -1745,9 +1745,9 @@ async function handleMemoryLearn(req, res) {
   // The cloud model is non-deterministic and often returns PARTIAL facts on any single
   // call; run a few passes and UNION the results so we capture the full set.
   const collected = new Map();
-  const temps = [0, 0.5, 0.8]; // vary temperature so passes differ (defeats temp-0 caching) → fuller union
-  for (let attempt = 0; attempt < temps.length; attempt++) {
-    const out = await llmComplete(msgs, { maxTokens: 1500, temperature: temps[attempt] });
+  const temps = [0, 0.5, 0.8]; // varied temps so passes differ → fuller union; run in PARALLEL for speed
+  const outs = await Promise.all(temps.map((t) => llmComplete(msgs, { maxTokens: 1500, temperature: t })));
+  for (const out of outs) {
     let arr = []; try { const m = out.match(/\[[\s\S]*\]/); if (m) arr = JSON.parse(m[0]); } catch (_) {}
     if (Array.isArray(arr)) for (const f of arr) { const s = String(f || "").trim(); if (s && s.length <= 140) { const k = s.toLowerCase(); if (!collected.has(k)) collected.set(k, s); } }
   }
