@@ -47,6 +47,13 @@ const PUTER_DRIVER_URL    = "https://api.puter.com/drivers/call";
 const PUTER_MODEL_ALIASES = { "nano-banana": "gemini-2.5-flash-image-preview", "nano-banana-pro": "gemini-3-pro-image-preview" };
 function puterEngineTag() { const m = PUTER_MODEL_ALIASES[PUTER_IMAGE_MODEL] || PUTER_IMAGE_MODEL; return m + (/gpt-image-(2|1\.5)/i.test(m) ? " " + PUTER_IMAGE_QUALITY : ""); }
 let _puterCooldownUntil = 0; // set when Puter is out of credits → skip the doomed 402 call briefly
+// Cloudflare Workers AI — RELIABLE FREE fallback (10k neurons/day ≈ ~150-200 imgs/day, no
+// card). FLUX.1-schnell quality (≈ pollinations). Server-side token → no user login. Free
+// Cloudflare account → Account ID + an API token with "Workers AI" permission.
+const CF_ACCOUNT_ID  = env("CF_ACCOUNT_ID") || "";
+const CF_API_TOKEN   = env("CF_API_TOKEN") || "";
+const CF_IMAGE_MODEL = env("CF_IMAGE_MODEL") || "@cf/black-forest-labs/flux-1-schnell";
+const CF_IMAGE_STEPS = Math.min(8, Math.max(1, parseInt(env("CF_IMAGE_STEPS") || "6", 10) || 6));
 const UPSTREAM_TIMEOUT_MS = Number(env("REQUEST_TIMEOUT_MS")) || 300000;
 
 const COOKIE_NAME = "firas_session";
@@ -567,6 +574,36 @@ async function generateImagePuter(prompt) {
   finally { clearTimeout(to); }
 }
 
+// Generate an image via Cloudflare Workers AI (free daily quota, reliable). flux-schnell
+// returns base64 in {result:{image}}; SDXL-style models return raw bytes. {bytes,mime}|null.
+async function generateImageCloudflare(prompt) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) return null;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 60000);
+  try {
+    const url = "https://api.cloudflare.com/client/v4/accounts/" + CF_ACCOUNT_ID + "/ai/run/" + CF_IMAGE_MODEL;
+    const body = { prompt: String(prompt || "").slice(0, 2000) };
+    if (/flux/i.test(CF_IMAGE_MODEL)) body.steps = CF_IMAGE_STEPS;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + CF_API_TOKEN, "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    if (!r.ok) return null;
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (ct.startsWith("image/")) { const bytes = new Uint8Array(await r.arrayBuffer()); return bytes.length ? { bytes, mime: ct } : null; }
+    const j = await r.json().catch(() => null);
+    const b64 = j && j.result && (j.result.image || (Array.isArray(j.result.images) && j.result.images[0]));
+    if (typeof b64 === "string" && b64.length > 100) {
+      const clean = b64.startsWith("data:") ? b64.slice(b64.indexOf(",") + 1) : b64;
+      try { return { bytes: b64ToBytes(clean), mime: "image/jpeg" }; } catch (_) { return null; }
+    }
+    return null;
+  } catch (_) { return null; }
+  finally { clearTimeout(to); }
+}
+
 // Generate an image with Gemini (Google AI Studio). Returns {bytes, mime} or null to
 // fall back to pollinations. Free key, ~500/day, no card.
 async function generateImageGemini(prompt) {
@@ -823,6 +860,14 @@ export default async (request, context) => {
         if (gem && gem.bytes && gem.bytes.length) {
           if (isNew) { try { await dbPut(`imgQuota/${user.id}/${day}/${cid}`, true); } catch (_) {} }
           return new Response(gem.bytes, { headers: { "Content-Type": gem.mime, "Cache-Control": "public, max-age=86400" } });
+        }
+      } catch (_) { /* fall through */ }
+      // Cloudflare Workers AI (free daily quota, reliable) → flux-schnell quality.
+      try {
+        const cf = await generateImageCloudflare(prompt);
+        if (cf && cf.bytes && cf.bytes.length) {
+          if (isNew) { try { await dbPut(`imgQuota/${user.id}/${day}/${cid}`, true); } catch (_) {} }
+          return new Response(cf.bytes, { headers: { "Content-Type": cf.mime, "Cache-Control": "public, max-age=86400" } });
         }
       } catch (_) { /* fall through */ }
       // Hugging Face FLUX.1-schnell (free token) → lossless PNG; ~on par with keyless.

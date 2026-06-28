@@ -87,6 +87,15 @@ const PUTER_IMAGE_QUALITY = process.env.PUTER_IMAGE_QUALITY || "low"; // gpt-ima
 const PUTER_DRIVER_URL    = "https://api.puter.com/drivers/call";
 // Friendly aliases (mirrors puter.js so PUTER_IMAGE_MODEL=nano-banana works server-side)
 const PUTER_MODEL_ALIASES = { "nano-banana": "gemini-2.5-flash-image-preview", "nano-banana-pro": "gemini-3-pro-image-preview" };
+// Cloudflare Workers AI image generation — RELIABLE FREE fallback (10,000 neurons/day
+// free ≈ ~150-200 images/day, no card). FLUX.1-schnell quality (≈ pollinations, NOT
+// gpt-image/Gemini). Server-side with the developer's token → no user login. Needs a
+// free Cloudflare account: dash.cloudflare.com → Account ID + an API token with the
+// "Workers AI" permission. Tried after the premium engines, before keyless pollinations.
+const CF_ACCOUNT_ID  = process.env.CF_ACCOUNT_ID || "";
+const CF_API_TOKEN   = process.env.CF_API_TOKEN || "";
+const CF_IMAGE_MODEL = process.env.CF_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
+const CF_IMAGE_STEPS = Math.min(8, Math.max(1, parseInt(process.env.CF_IMAGE_STEPS || "6", 10) || 6)); // flux-schnell max 8
 
 // Tier -> Ollama model + generation params (env-overridable).
 // num_predict = MAX output tokens. Generous so long outputs (a full single-file
@@ -1244,6 +1253,41 @@ async function generateImagePuter(prompt) {
   finally { clearTimeout(to); }
 }
 
+// Generate an image via Cloudflare Workers AI (free daily quota, reliable). flux-schnell
+// returns base64 in {result:{image}}; SDXL-style models return raw bytes. {buf,mime}|null.
+async function generateImageCloudflare(prompt) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) return null;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 60_000);
+  try {
+    const url = "https://api.cloudflare.com/client/v4/accounts/" + CF_ACCOUNT_ID + "/ai/run/" + CF_IMAGE_MODEL;
+    const body = { prompt: String(prompt || "").slice(0, 2000) };
+    if (/flux/i.test(CF_IMAGE_MODEL)) body.steps = CF_IMAGE_STEPS;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + CF_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    if (!r.ok) { console.error("[firas] Cloudflare image HTTP " + r.status + ": " + (await r.text().catch(() => "")).slice(0, 200)); return null; }
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    if (ct.startsWith("image/")) {
+      const buf = Buffer.from(await r.arrayBuffer());
+      return buf.length ? { buf, mime: ct } : null;
+    }
+    const j = await r.json().catch(() => null);
+    const b64 = j && j.result && (j.result.image || (Array.isArray(j.result.images) && j.result.images[0]));
+    if (typeof b64 === "string" && b64.length > 100) {
+      const clean = b64.startsWith("data:") ? b64.slice(b64.indexOf(",") + 1) : b64;
+      const buf = Buffer.from(clean, "base64");
+      return buf.length ? { buf, mime: "image/jpeg" } : null;
+    }
+    if (j && j.success === false) console.error("[firas] Cloudflare image error: " + JSON.stringify(j.errors || j).slice(0, 200));
+    return null;
+  } catch (e) { console.error("[firas] Cloudflare image exception: " + (e && e.message || e)); return null; }
+  finally { clearTimeout(to); }
+}
+
 async function generateImageGemini(prompt) {
   if (!GEMINI_API_KEY) return null;
   const ac = new AbortController();
@@ -1344,6 +1388,17 @@ async function handleImage(req, res) {
     }
     if (GEMINI_API_KEY) console.error("[firas] Gemini returned no image → next engine");
   } catch (_) { if (GEMINI_API_KEY) console.error("[firas] Gemini error → next engine"); }
+  // 1c) Cloudflare Workers AI (free daily quota, reliable) → flux-schnell quality.
+  try {
+    const cf = await generateImageCloudflare(prompt);
+    if (cf && cf.buf && cf.buf.length) {
+      console.log("[firas] image served by Cloudflare (" + CF_IMAGE_MODEL + ")");
+      await imgCacheSet(ckey, cf.buf, cf.mime);
+      if (isNew) { user.imgCids.push(cid); persist(); }
+      res.writeHead(200, { "Content-Type": cf.mime, "Cache-Control": "public, max-age=86400" });
+      return res.end(cf.buf);
+    }
+  } catch (_) { /* fall through to HF/pollinations */ }
   // 1b) Hugging Face FLUX.1-schnell (free token) → lossless PNG; ~on par with keyless.
   try {
     const hf = await generateImageHF(prompt);
