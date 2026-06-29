@@ -492,7 +492,7 @@ const state = {
   activeId: null,
   tier: CONFIG.DEFAULT_TIER,
   mode: "auto",       // response mode: "auto" | "plan" (separate from tier)
-  theme: "light",
+  theme: "dark",      // DARK is the default theme (overridable via the toggle)
   lang: "ar",
   think: true,        // device pref: send reasoning request to backend
   webSearch: false,   // device pref: force web search on every message (all tiers)
@@ -768,7 +768,7 @@ function loadState() {
   if (!MODELS[state.tier]) state.tier = CONFIG.DEFAULT_TIER;
   state.mode = localStorage.getItem(LS_MODE) || "auto";
   if (!MODES[state.mode]) state.mode = "auto";
-  state.theme = localStorage.getItem(LS_THEME) || "light";
+  state.theme = localStorage.getItem(LS_THEME) || "dark"; // DARK by default
   state.sidebarCollapsed = localStorage.getItem(LS_SIDEBAR) === "true";
   const savedThink = localStorage.getItem(LS_THINK);
   state.think = savedThink === null ? true : savedThink === "true";
