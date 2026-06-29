@@ -3482,12 +3482,13 @@ async function exportPdf(turn, lang, msg) {
     const pageW = 210, pageH = 297, mL = 14, mT = 15, mB = 16;
     const contentW = pageW - mL - 14;           // 182mm text column
     const contentH = pageH - mT - mB;           // 266mm text height
-    // Adaptive scale: crisp (~300 DPI) for normal docs, auto-reduced for very long ones so the
-    // single html2canvas capture never exceeds the browser's max canvas size (which would blank/
-    // clip the bottom — a cause of "deleted" content).
-    const _docPxH = ((root.querySelector(".doc") || {}).scrollHeight) || 1;
-    const scale = (_docPxH * 2.7 > 30000) ? Math.max(1.6, 30000 / _docPxH) : 2.7;
-    const toJpeg = (c) => c.toDataURL("image/jpeg", 0.97);
+    // FIXED crisp scale (~230 DPI). The document is captured below in SAFE-SIZED CHUNKS, so no
+    // single canvas ever approaches the browser's max canvas size (Safari/desktop ~16k px, where
+    // one giant capture silently BLANKS or HANGS) — quality stays high at ANY document length, and
+    // the page never freezes (we yield between chunks).
+    const scale = 2.4;
+    const SAFE_CANVAS_PX = 11000;                  // keep every capture's canvas height under this
+    const toJpeg = (c) => c.toDataURL("image/jpeg", 0.95);
     let pageStarted = false;
 
     // ---- Cover: full-bleed page 1 ----
@@ -3495,51 +3496,86 @@ async function exportPdf(turn, lang, msg) {
     if (coverEl) {
       const cc = await H2C(coverEl, { scale, backgroundColor: "#" + th.deep, windowWidth: 794, logging: false, useCORS: true });
       pdf.addImage(toJpeg(cc), "JPEG", 0, 0, pageW, pageH, undefined, "FAST");
+      cc.width = cc.height = 0;                     // free the canvas immediately
       pageStarted = true;
     }
 
-    // ---- Content: render .doc once, paginate at block boundaries (never split an equation/table/figure) ----
+    // ---- Content: capture in chunks of a few pages, paginate each at block boundaries ----
     const docEl = root.querySelector(".doc");
-    const dc = await H2C(docEl, { scale, backgroundColor: bg, windowWidth: 794, logging: false, useCORS: true });
-    const pxPerMm = dc.width / contentW;
-    const pageHpx = Math.floor(contentH * pxPerMm);
-    const dTop = docEl.getBoundingClientRect().top;
-    // Break candidates = the BOTTOM edge (canvas px) of every block we must not split:
-    // direct children PLUS display equations, tables, images, code, lists, paragraphs &
-    // headings (even when nested), so a page can always end cleanly before a tall block.
-    const headings = new Set(docEl.querySelectorAll("h1, h2, h3, h4, h5, h6"));
-    const blockEls = new Set([
-      ...docEl.querySelectorAll(":scope > *"),
-      ...docEl.querySelectorAll(".katex-display, table, img, pre, blockquote, figure, p, li"),
-    ]);
-    const raw = [];
-    // Non-heading blocks: break AFTER (bottom edge). Headings: break BEFORE (top edge) so a
-    // heading is never left orphaned at the bottom — it travels to the next page WITH its content.
-    for (const el of blockEls) { if (!headings.has(el)) raw.push((el.getBoundingClientRect().bottom - dTop) * scale); }
-    for (const el of headings) { raw.push((el.getBoundingClientRect().top - dTop) * scale); }
-    const bounds = raw.map((b) => Math.round(b)).filter((b) => b > 0).sort((a, b) => a - b);
-    const MIN_FILL = pageHpx * 0.12;   // allow an early break to push a tall block down, but avoid near-empty pages
-    let start = 0;
-    while (start < dc.height - 1) {
-      const maxEnd = Math.min(start + pageHpx, dc.height);
-      let end = maxEnd;
-      if (end < dc.height) {
-        // largest block boundary that fits → clean break, no split. If none fits, a single
-        // block is taller than a whole page → forced split at maxEnd (unavoidable).
-        let cut = 0;
-        for (const b of bounds) { if (b > start + MIN_FILL && b <= maxEnd) cut = b; }
-        if (cut > start) end = cut;
+    const docW = docEl.getBoundingClientRect().width || 794;
+    const cssPerMm = docW / contentW;
+    const pageCssH = contentH * cssPerMm;          // one A4 content page, in CSS px
+    const chunkCssCap = Math.max(pageCssH, Math.floor((SAFE_CANVAS_PX / scale) * 0.8)); // headroom for margins/padding
+    // Group top-level blocks into chunks that fit a safe canvas (each block kept whole).
+    const chunks = [];
+    let curBlocks = [], curH = 0;
+    for (const b of docEl.children) {
+      const h = b.getBoundingClientRect().height || 0;
+      if (curBlocks.length && curH + h > chunkCssCap) { chunks.push({ blocks: curBlocks, h: curH }); curBlocks = []; curH = 0; }
+      curBlocks.push(b); curH += h;
+    }
+    if (curBlocks.length) chunks.push({ blocks: curBlocks, h: curH });
+    const buildingMsg = lang === "ar" ? "جاري إنشاء PDF… " : "Building PDF… ";
+
+    for (let ci = 0; ci < chunks.length; ci++) {
+      // progress + yield → the browser stays responsive (never freezes) and shows movement
+      showToast(buildingMsg + Math.round((ci / chunks.length) * 100) + "%");
+      await new Promise((r) => setTimeout(r, 0));
+      // Clone just this chunk into a .doc INSIDE root (so the scoped export CSS + rendered KaTeX apply).
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:absolute;left:0;top:0;width:" + docW + "px;";
+      const docClone = document.createElement("div");
+      docClone.className = "doc";
+      docClone.style.width = docW + "px";
+      for (const b of chunks[ci].blocks) docClone.appendChild(b.cloneNode(true));
+      holder.appendChild(docClone);
+      root.appendChild(holder);
+      // Per-chunk scale clamp uses the clone's ACTUAL rendered height (incl. margins/padding the
+      // estimate missed) so the canvas is GUARANTEED within the safe size, even if a block is huge.
+      const realH = docClone.scrollHeight || chunks[ci].h;
+      const chScale = Math.min(scale, SAFE_CANVAS_PX / Math.max(1, realH));
+      const dc = await H2C(docClone, { scale: chScale, backgroundColor: bg, windowWidth: 794, logging: false, useCORS: true });
+      // Break candidates WITHIN this chunk (clone still in the DOM so rects are valid).
+      const dTop = docClone.getBoundingClientRect().top;
+      const headings = new Set(docClone.querySelectorAll("h1, h2, h3, h4, h5, h6"));
+      const blockEls = new Set([
+        ...docClone.querySelectorAll(":scope > *"),
+        ...docClone.querySelectorAll(".katex-display, table, img, pre, blockquote, figure, p, li"),
+      ]);
+      const raw = [];
+      // Non-heading blocks: break AFTER (bottom). Headings: break BEFORE (top) so a heading
+      // never orphans at a page bottom — it travels to the next page WITH its content.
+      for (const el of blockEls) { if (!headings.has(el)) raw.push((el.getBoundingClientRect().bottom - dTop) * chScale); }
+      for (const el of headings) { raw.push((el.getBoundingClientRect().top - dTop) * chScale); }
+      holder.remove();                              // done measuring → detach (frees layout)
+      const pxPerMm = dc.width / contentW;
+      const pageHpx = Math.floor(contentH * pxPerMm);
+      const bounds = raw.map((b) => Math.round(b)).filter((b) => b > 0).sort((a, b) => a - b);
+      const MIN_FILL = pageHpx * 0.12;              // allow an early break to push a tall block down
+      let start = 0;
+      while (start < dc.height - 1) {
+        const maxEnd = Math.min(start + pageHpx, dc.height);
+        let end = maxEnd;
+        if (end < dc.height) {
+          // largest block boundary that fits → clean break, no split. If none fits, a single
+          // block is taller than a page → forced split at maxEnd (unavoidable).
+          let cut = 0;
+          for (const b of bounds) { if (b > start + MIN_FILL && b <= maxEnd) cut = b; }
+          if (cut > start) end = cut;
+        }
+        const sliceH = Math.max(1, end - start);
+        const tmp = document.createElement("canvas");
+        tmp.width = dc.width; tmp.height = sliceH;
+        const ctx = tmp.getContext("2d");
+        ctx.fillStyle = bg; ctx.fillRect(0, 0, tmp.width, tmp.height);
+        ctx.drawImage(dc, 0, start, dc.width, sliceH, 0, 0, dc.width, sliceH);
+        if (pageStarted) pdf.addPage();
+        pageStarted = true;
+        pdf.addImage(toJpeg(tmp), "JPEG", mL, mT, contentW, sliceH / pxPerMm, undefined, "FAST");
+        tmp.width = tmp.height = 0;                 // free the slice canvas
+        start = end;
       }
-      const sliceH = Math.max(1, end - start);
-      const tmp = document.createElement("canvas");
-      tmp.width = dc.width; tmp.height = sliceH;
-      const ctx = tmp.getContext("2d");
-      ctx.fillStyle = bg; ctx.fillRect(0, 0, tmp.width, tmp.height);
-      ctx.drawImage(dc, 0, start, dc.width, sliceH, 0, 0, dc.width, sliceH);
-      if (pageStarted) pdf.addPage();
-      pageStarted = true;
-      pdf.addImage(toJpeg(tmp), "JPEG", mL, mT, contentW, sliceH / pxPerMm, undefined, "FAST");
-      start = end;
+      dc.width = dc.height = 0;                      // free the chunk canvas before the next chunk
     }
 
     // ---- Footers with page numbers (skip the cover) ----
