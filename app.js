@@ -4881,8 +4881,8 @@ async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) 
     const extracted = await extractImageSource(srcImages, userText, lang, signal, onStage);
     if (extracted) {
       userText += (lang === "ar"
-        ? "\n\n=== المحتوى المُستخرَج بالكامل من الصورة/الصور المرفقة (المصدر — استخدمه كاملًا ولا تُسقِط أي عنصر) ===\n"
-        : "\n\n=== FULL CONTENT EXTRACTED FROM THE ATTACHED IMAGE(S) (the source — use ALL of it, drop nothing) ===\n") + extracted;
+        ? "\n\n[تعليمات: إن طُلبت نسخة «بنفس النمط» أو «مشابهة»، طابِق بنية المصدر تطابقًا تامًّا — نفس عدد الأسئلة وترقيمها وأجزائها الفرعية (A/B/C) وتعليمات الاختيار («اختر ٤ فقط» …) والدرجات والعناوين والترتيب — وغيّر صعوبة المحتوى فقط. أخرِج كل سؤالٍ وكل جزءٍ كاملًا دون نقص.]\n\n=== المحتوى المُستخرَج بالكامل من الصورة/الصور المرفقة (المصدر) ===\n"
+        : "\n\n[Instructions: if a 'same pattern'/'similar' version is requested, MIRROR the source's structure EXACTLY — same number of questions, numbering, sub-parts (A/B/C), selection instructions ('choose 4 only' …), marks, headings and order — change ONLY the difficulty. Output every question and every part in full, dropping nothing.]\n\n=== FULL CONTENT EXTRACTED FROM THE ATTACHED IMAGE(S) (the source) ===\n") + extracted;
     }
   }
   // BIG-COUNT branch: a request for many items ("1000 integrals/problems/questions…")
@@ -5406,8 +5406,8 @@ async function streamAnswer(aiMsg, aiNode, chat) {
             }
           }
           const cmpSys = replyLang === "ar"
-            ? "أرفق المستخدم صورة وطلب إنشاء محتوى منها، وقد استُخرج محتوى الصورة كاملًا ووُضع في رسالته كمصدر. نفّذ الطلب بالكامل اعتمادًا على هذا المصدر: غطِّ كل عنصر وكل سؤال/جزء دون إسقاط أي شيء، وأكمل إلى النهاية دون توقّف مبكّر أو اختصار مهما طال الجواب. اكتب الرياضيات بصيغة LaTeX."
-            : "The user attached an image and asked to create content from it; the image's full content was extracted into their message as the source. Fulfil the request COMPLETELY from that source: cover every item and every question/part, drop nothing, and continue to the very end with no early stop or truncation however long the answer. Write math in LaTeX.";
+            ? "أرفق المستخدم صورةً لمستند/امتحان والمحتوى الكامل للمصدر موجودٌ في رسالته. إن طلب «نفس النمط» أو «مشابهة» فأنشئ نسخةً جديدةً **تطابق بنية المصدر تطابقًا تامًّا**: نفس عدد الأسئلة الكلّي، ونفس ترقيمها (سؤال ١، ٢، …)، ونفس الأجزاء الفرعية وحروفها (A/B/C أو أ/ب/ج و(1)(2)…)، ونفس تعليمات الاختيار حرفيًّا (مثل «اختر ٤ فقط» / «اختر واحدًا فقط»)، ونفس الدرجات الموزّعة (… M)، ونفس العناوين والترتيب والتنسيق العام. **لا تُغيّر البنية ولا عدد الأسئلة ولا الأجزاء إطلاقًا** — غيّر **صعوبة محتوى المسائل فقط** (نفس الموضوع لكن أعمق وأصعب). أخرِج **كل** سؤالٍ وكل جزءٍ كاملًا من الأول إلى الآخر — نفس عدد عناصر المصدر تمامًا — دون إسقاطٍ أو حذفٍ أو توقّفٍ مبكّرٍ أو اختصارٍ مهما طال. اكتب الرياضيات بصيغة LaTeX، ولا تَحلّ الأسئلة إلا إذا طُلب ذلك صراحةً. التزم بأوامر المستخدم بدقّة ولا تُضِف أقسامًا أو نصائح لم يطلبها."
+            : "The user attached an image of a document/exam; its full content is in their message as the source. If they asked for the 'same pattern'/'similar', produce a NEW version that MIRRORS the source's structure EXACTLY: same total number of questions, same numbering (Q1, Q2, …), same sub-parts and their labels (A/B/C and (1)(2)…), same selection instructions verbatim (e.g. 'choose 4 only' / 'choose one only'), same mark allocations (… M), same headings, order and overall format. Do NOT change the structure, the number of questions, or the parts — change ONLY the DIFFICULTY of the problems (same topics, deeper and harder). Output EVERY question and EVERY part in full, from first to last — the SAME count as the source — with no dropping, omission, early stop, or summarizing, however long. Write math in LaTeX, and do NOT solve the questions unless explicitly asked. Follow the user's instructions exactly and don't add sections or tips they didn't request.";
           requestMessages = [requestMessages[0], { role: "system", content: cmpSys }, ...requestMessages.slice(1)];
           if (requestTier === "mini") requestTier = "pro"; // ensure a strong generator
           did2Stage = true;
