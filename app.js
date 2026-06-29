@@ -5030,14 +5030,19 @@ function batchAuthorSys(lang) {
     "BUT every final answer MUST be an EXACT closed form (rationals, \\pi, e, \\ln, \\arctan, \\sqrt, hyperbolic) — NO special functions " +
     "(no \\Gamma, \\zeta, \\operatorname{Li}, Si/Ci, elliptic) and NO numerical approximations. " +
     "CORRECTNESS IS NON-NEGOTIABLE: re-derive and VERIFY every answer (differentiate an antiderivative back, or sanity-check the definite value) before writing it. " +
-    "Be CREATIVE and VARIED — never repeat a pattern. No preamble, no commentary, no headings — nothing but the numbered problems and the answers." +
+    "ABSOLUTE VARIETY — THE #1 RULE: every single problem must be a genuinely NEW idea — a DIFFERENT integrand structure, a DIFFERENT technique, and a DIFFERENT answer form. " +
+    "It is STRICTLY FORBIDDEN to emit a 'family' that differs only by an exponent, coefficient, constant, sign, or integration bound (e.g. \\int x^2.., \\int x^3.., \\int \\sin^4.., \\int \\sin^6.. one after another) — that mechanical, series-like repetition is exactly what to avoid. No two problems may be recognizable variants of each other; each must look and feel like a fresh competition problem. " +
+    "No preamble, no commentary, no headings — nothing but the numbered problems and the answers." +
     seedExamples() + agentBrand(lang);
 }
-function batchUserMsg(userText, start, end, cat, lang) {
+function batchUserMsg(userText, start, end, cats, lang) {
+  const list = (Array.isArray(cats) ? cats : [cats]).map((c) => "  • " + c).join("\n");
   return "Workbook request (context): " + String(userText).slice(0, 600) +
-    "\n\nGenerate problems numbered EXACTLY " + start + " to " + end + " (" + (end - start + 1) + " problems), this batch " +
-    "FOCUSED on: " + cat + ". Make them genuinely HARD (JEE-Advanced / Olympiad) — avoid textbook clones and trivial polynomials; " +
-    "every problem should need a real technique. Keep all answers exact closed forms and VERIFIED correct. " +
+    "\n\nGenerate problems numbered EXACTLY " + start + " to " + end + " (" + (end - start + 1) + " problems). " +
+    "SPREAD them roughly evenly ACROSS these DISTINCT techniques (don't dwell on one):\n" + list +
+    "\n\nVARIETY IS THE TOP PRIORITY: every problem must be a STRUCTURALLY different integrand with its OWN idea and a different answer form. " +
+    "NEVER write a run of problems that differ only by an exponent/coefficient/constant/bound — no two may be recognizable variants. " +
+    "Make them genuinely HARD (JEE-Advanced / Olympiad), each needing a real technique; all answers EXACT closed forms and VERIFIED correct. " +
     "Output the numbered problems, then `<!--ANSWERS-->`, then the final answers.";
 }
 /** Run async workers over items with a concurrency cap; results returned in order. */
@@ -5064,8 +5069,13 @@ async function runBatchedFileDoc(userText, count, fmt, lang, tierKey, signal, on
   // (JEE/Olympiad) problems take longer to author+verify, so smaller batches finish more
   // reliably inside the per-batch cap and more of them complete within the time budget.
   const BATCH = 28;
+  const CATS_PER_BATCH = 5;            // each batch spans several techniques → far less in-batch repetition
   const ranges = [];
-  for (let i = 0; i < Math.ceil(count / BATCH); i++) ranges.push({ start: i * BATCH + 1, end: Math.min((i + 1) * BATCH, count), cat: DEFAULT_ITEM_CATEGORIES[i % DEFAULT_ITEM_CATEGORIES.length] });
+  const nBatches = Math.ceil(count / BATCH);
+  for (let i = 0; i < nBatches; i++) {
+    const cats = Array.from({ length: CATS_PER_BATCH }, (_, k) => DEFAULT_ITEM_CATEGORIES[(i * CATS_PER_BATCH + k) % DEFAULT_ITEM_CATEGORIES.length]);
+    ranges.push({ start: i * BATCH + 1, end: Math.min((i + 1) * BATCH, count), cats });
+  }
   onStage("content");
   // gpt-oss is a slow reasoning model (~5s/problem → a 50-item batch ≈ 200s). Give each
   // batch a generous cap (close to the server's own 5-min limit) so valid batches aren't
@@ -5085,7 +5095,7 @@ async function runBatchedFileDoc(userText, count, fmt, lang, tierKey, signal, on
     try {
       return (await callAgentText([
         { role: "system", content: batchAuthorSys(lang) },
-        { role: "user", content: batchUserMsg(userText, r.start, r.end, r.cat, lang) },
+        { role: "user", content: batchUserMsg(userText, r.start, r.end, r.cats, lang) },
       ], tierKey, ac.signal)).trim();
     } catch (_) {
       return "";                         // errored / per-batch cap / overall stop → skip, keep what we have
