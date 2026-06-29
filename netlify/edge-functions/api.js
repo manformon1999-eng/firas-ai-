@@ -271,61 +271,66 @@ async function sendEmail(to, subject, html, opts) {
 function fmtNow() { try { return new Date().toLocaleString("ar", { dateStyle: "long", timeStyle: "short" }); } catch (_) { return new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC"; } }
 function ltr(s) { return '<span dir="ltr" style="unicode-bidi:isolate;">' + s + '</span>'; }
 function bidiAuto(s) { return '<span dir="auto" style="unicode-bidi:isolate;">' + s + '</span>'; }
+const EMAIL_FONT = "'IBM Plex Sans Arabic','Inter','Segoe UI',Tahoma,Arial,sans-serif";
 function mailButton(link, label) {
-  return '<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:10px auto 2px;"><tr>' +
-    '<td style="border-radius:11px;background:#57AE9C;box-shadow:0 8px 22px rgba(87,174,156,0.32);" bgcolor="#57AE9C"><a href="' + link + '" style="display:inline-block;padding:14px 34px;font:800 15px \'Segoe UI\',Tahoma,Arial,sans-serif;color:#1F1E1D;text-decoration:none;border-radius:11px;">' + label + '</a></td>' +
+  return '<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:16px auto 2px;"><tr>' +
+    '<td style="border-radius:12px;background:#57AE9C;box-shadow:0 10px 26px rgba(87,174,156,0.34);" bgcolor="#57AE9C"><a href="' + link + '" style="display:inline-block;padding:15px 42px;font-family:' + EMAIL_FONT + ';font-size:16px;font-weight:700;color:#10221D;text-decoration:none;border-radius:12px;letter-spacing:.2px;">' + label + '</a></td>' +
     '</tr></table>';
 }
 function mailLink(link) {
-  return '<p style="margin:18px 0 0;font-size:12px;color:#76746C;" dir="rtl">أو افتح هذا الرابط:<br><span dir="ltr" style="unicode-bidi:isolate;word-break:break-all;"><a href="' + link + '" style="color:#6BC0AE;">' + link + '</a></span></p>';
+  return '<p style="margin:20px 0 0;font-size:12.5px;color:#9C9A91;" dir="rtl">أو افتح هذا الرابط:<br><span dir="ltr" style="unicode-bidi:isolate;word-break:break-all;"><a href="' + link + '" style="color:#6BC0AE;">' + link + '</a></span></p>';
 }
 function brandedEmail(o) {
-  // Matches the SITE's dark theme EXACTLY: warm charcoal gray + teal accent; glow in TOP-RIGHT
-  // and BOTTOM-LEFT corners (page radial gradients + diagonal card box-shadows).
+  // Matches the SITE's dark theme + fonts (IBM Plex Sans Arabic / Inter w/ system fallbacks).
+  // Bright + bold text; glow in TOP-RIGHT + BOTTOM-LEFT corners.
   const bg = "#262624", card = "#30302E", border = "#46453F", hair = "#3A3A36",
-        ink = "#ECEAE3", muted = "#A6A39A", soft = "#76746C", accent = "#57AE9C", accent2 = "#6BC0AE", onacc = "#1F1E1D";
-  const font = "'Segoe UI',Tahoma,Arial,'Helvetica Neue',sans-serif";
+        ink = "#F6F4ED", muted = "#C2BFB6", soft = "#8C8A81", accent = "#57AE9C", accent2 = "#6BC0AE", onacc = "#10221D";
+  const font = EMAIL_FONT;
   const time = o.time || fmtNow();
-  const pageBg = "background:radial-gradient(58% 48% at 100% 0%,rgba(87,174,156,0.20),transparent 70%),radial-gradient(58% 48% at 0% 100%,rgba(87,174,156,0.16),transparent 70%)," + bg + ";";
-  const cardGlow = "box-shadow:0 0 0 1px rgba(87,174,156,0.10),26px -26px 90px -14px rgba(87,174,156,0.22),-26px 26px 90px -14px rgba(87,174,156,0.20),0 26px 60px rgba(0,0,0,0.5);";
+  const pageBg = "background:radial-gradient(60% 50% at 100% 0%,rgba(87,174,156,0.22),transparent 70%),radial-gradient(60% 50% at 0% 100%,rgba(87,174,156,0.17),transparent 70%)," + bg + ";";
+  const cardGlow = "box-shadow:0 0 0 1px rgba(87,174,156,0.12),28px -28px 100px -16px rgba(87,174,156,0.24),-28px 28px 100px -16px rgba(87,174,156,0.20),0 28px 64px rgba(0,0,0,0.55);";
   return '<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    '<meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark"></head>' +
-    '<body bgcolor="' + bg + '" style="margin:0;padding:0;background:' + bg + ';' + pageBg + '">' +
+    '<meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark">' +
+    '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>' +
+    '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">' +
+    '<style>body,table,td,h1,p,a,span{font-family:' + font + ' !important;}</style></head>' +
+    '<body bgcolor="' + bg + '" style="margin:0;padding:0;background:' + bg + ';' + pageBg + 'font-family:' + font + ';">' +
     '<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:' + bg + ';">' + (o.preheader || "") + '</div>' +
-    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + bg + '" style="' + pageBg + 'padding:40px 14px;"><tr><td align="center">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + bg + '" style="' + pageBg + 'padding:42px 14px;"><tr><td align="center">' +
     '<table role="presentation" width="600" cellpadding="0" cellspacing="0" bgcolor="' + card + '" style="max-width:600px;width:100%;background:' + card + ';border:1px solid ' + border + ';border-radius:18px;overflow:hidden;' + cardGlow + '">' +
     '<tr><td style="height:3px;background:linear-gradient(90deg,' + accent + ',' + accent2 + ');font-size:0;line-height:0;" bgcolor="' + accent + '">&nbsp;</td></tr>' +
-    '<tr><td style="padding:28px 32px 8px;"><table role="presentation" cellpadding="0" cellspacing="0" dir="ltr"><tr>' +
-      '<td style="width:46px;height:46px;border-radius:13px;background:' + accent + ';text-align:center;font:800 24px/46px ' + font + ';color:' + onacc + ';" bgcolor="' + accent + '">F</td>' +
-      '<td style="padding-left:12px;font:700 20px/1 ' + font + ';letter-spacing:.5px;color:' + ink + ';" dir="ltr">Firas<span style="color:' + accent + ';"> AI</span></td>' +
+    '<tr><td style="padding:30px 34px 10px;"><table role="presentation" cellpadding="0" cellspacing="0" dir="ltr"><tr>' +
+      '<td style="width:48px;height:48px;border-radius:14px;background:' + accent + ';text-align:center;font-family:' + font + ';font-size:25px;font-weight:800;line-height:48px;color:' + onacc + ';" bgcolor="' + accent + '">F</td>' +
+      '<td style="padding-left:13px;font-family:' + font + ';font-size:21px;font-weight:700;line-height:1;letter-spacing:.3px;color:' + ink + ';" dir="ltr">Firas<span style="color:' + accent + ';"> AI</span></td>' +
     '</tr></table></td></tr>' +
-    '<tr><td dir="rtl" style="padding:18px 32px 6px;font-family:' + font + ';color:' + ink + ';text-align:right;">' +
-      '<h1 style="margin:0 0 12px;font-size:22px;font-weight:800;color:' + ink + ';line-height:1.45;">' + o.heading + '</h1>' +
-      '<p style="margin:0 0 20px;font-size:15px;line-height:1.9;color:' + muted + ';">' + o.lead + '</p>' +
+    '<tr><td dir="rtl" style="padding:18px 34px 6px;font-family:' + font + ';color:' + ink + ';text-align:right;">' +
+      '<h1 style="margin:0 0 10px;font-size:23px;font-weight:700;color:' + ink + ';line-height:1.5;">' + o.heading + '</h1>' +
+      '<div style="width:40px;height:3px;border-radius:3px;background:' + accent + ';margin:0 0 18px;"></div>' +
+      '<p style="margin:0 0 18px;font-size:15.5px;line-height:1.95;color:' + muted + ';">' + o.lead + '</p>' +
       o.contentHtml +
-      (o.note ? '<p style="margin:22px 0 0;font-size:13px;line-height:1.75;color:' + soft + ';">' + o.note + '</p>' : '') +
+      (o.note ? '<p style="margin:24px 0 0;font-size:13px;line-height:1.8;color:' + soft + ';">' + o.note + '</p>' : '') +
     '</td></tr>' +
-    '<tr><td dir="rtl" style="padding:16px 32px 2px;font-family:' + font + ';font-size:12px;color:' + soft + ';text-align:right;">أُرسلت في: ' + time + '</td></tr>' +
-    '<tr><td style="padding:18px 32px 0;"><div style="border-top:1px solid ' + hair + ';"></div></td></tr>' +
-    '<tr><td style="padding:16px 32px 28px;font-family:' + font + ';text-align:center;">' +
-      '<p style="margin:0 0 4px;font:700 13px/1 ' + font + ';letter-spacing:2px;color:' + accent + ';" dir="ltr">FIRAS AI</p>' +
+    '<tr><td dir="rtl" style="padding:18px 34px 2px;font-family:' + font + ';font-size:12px;color:' + soft + ';text-align:right;">أُرسلت في: ' + time + '</td></tr>' +
+    '<tr><td style="padding:18px 34px 0;"><div style="border-top:1px solid ' + hair + ';"></div></td></tr>' +
+    '<tr><td style="padding:18px 34px 30px;font-family:' + font + ';text-align:center;">' +
+      '<p style="margin:0 0 5px;font-family:' + font + ';font-size:13px;font-weight:700;letter-spacing:2px;color:' + accent + ';" dir="ltr">FIRAS AI</p>' +
       '<p style="margin:0;font-size:12px;color:' + soft + ';" dir="rtl">مساعدك الذكي · رسالة آلية، لا داعي للرد عليها.</p>' +
     '</td></tr></table>' +
-    '<p style="margin:16px 0 0;font:400 11px ' + font + ';color:#5c5a53;" dir="ltr">© Firas AI</p>' +
+    '<p style="margin:18px 0 0;font-family:' + font + ';font-size:11px;color:#6b695f;" dir="ltr">© Firas AI</p>' +
     '</td></tr></table></body></html>';
 }
 function escEmail(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 function welcomeEmailHtml(name, link) {
   const safe = escEmail(String(name || "").trim()) || "صديقي";
-  const p = (t) => '<p style="margin:0 0 14px;font-size:15px;line-height:1.95;color:#C6C3BA;">' + t + '</p>';
-  const brand = '<b style="color:#6BC0AE;">' + ltr("Firas AI") + '</b>';
+  const p = (t) => '<p style="margin:0 0 15px;font-size:15.5px;line-height:2;color:#DBD8CF;">' + t + '</p>';
+  const brand = '<b style="color:#6BC0AE;font-weight:700;">' + ltr("Firas AI") + '</b>';
   const content =
     p('شكراً لانضمامك إلى ' + brand + ' — حسابك صار جاهزاً ومفعّلاً بالكامل. 🎉') +
     p('أنا فراس، مطوّر المنصّة. بنيت ' + brand + ' ليكون مساعدك الذكي بالعربية والإنجليزية: محادثة، برمجة، بحث في الإنترنت، توليد صور، وملفات ' + ltr("PDF") + ' — كله مجاناً، وبأربعة نماذج تختار منها حسب حاجتك.') +
-    p('جرّب نموذج <b style="color:#6BC0AE;">' + ltr("Max") + '</b> الجديد (تجريبي) للأسئلة الصعبة والرياضيات. وإذا واجهت أي مشكلة أو عندك اقتراح، بابي مفتوح دائماً.') +
+    p('جرّب نموذج <b style="color:#6BC0AE;font-weight:700;">' + ltr("Max") + '</b> الجديد (تجريبي) للأسئلة الصعبة والرياضيات. وإذا واجهت أي مشكلة أو عندك اقتراح، بابي مفتوح دائماً.') +
     mailButton(link, "ابدأ المحادثة الآن") +
-    '<p style="margin:26px 0 0;font-size:14px;line-height:1.8;color:#A6A39A;">مع خالص التقدير،<br><b style="color:#ECEAE3;">فراس</b> · مطوّر ' + ltr("Firas AI") + '</p>';
+    '<p style="margin:28px 0 0;font-size:14.5px;line-height:1.85;color:#C2BFB6;">مع خالص التقدير،<br><b style="color:#F6F4ED;font-weight:700;">فراس</b> · مطوّر ' + ltr("Firas AI") + '</p>';
   return brandedEmail({ preheader: "أهلاً بك في Firas AI — رسالة من فراس", heading: "مرحباً بك يا " + bidiAuto(safe) + " 👋", lead: "يسعدني انضمامك إلى عائلة " + ltr("Firas AI") + ". هذي رسالة شخصية مني لك:", contentHtml: content });
 }
 function verifyEmailHtml(link) {
