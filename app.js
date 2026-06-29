@@ -152,6 +152,7 @@ const STR = {
     badge: "بواسطة",
     disclaimer: "قد يخطئ فِراس. تحقّق من المعلومات المهمة.",
     logout: "تسجيل الخروج",
+    settings: "الإعدادات",
     thinkOn: "التفكير مُفعّل — دقة أعلى",
     thinkOff: "التفكير مُعطّل — استجابة أسرع",
     thinkMaxBlocked: "عذراً، لا يمكنك استخدام ميزة التفكير في فِراس ماكس — قد يؤدي إلى كسر القيود.",
@@ -257,8 +258,8 @@ const STR = {
     authNewPassword: "كلمة المرور الجديدة",
     authResetDone: "تم تغيير كلمة المرور — سجّل الدخول الآن.",
     authResetInvalid: "الرابط غير صالح أو منتهي. اطلب رابطاً جديداً.",
-    authVerifyTitle: "تأكيد بريدك الإلكتروني",
-    authVerifySubtitle: "أرسلنا رابط تأكيد إلى",
+    authVerifyTitle: "📧 تفقّد بريدك الإلكتروني",
+    authVerifySubtitle: "أرسلنا رابط التأكيد إلى",
     authVerifyWaiting: "افتح الرابط من بريدك واضغط الزر — وسيكتمل الدخول هنا تلقائياً (حتى لو فتحته من جهاز آخر). تحقّق من صندوق الوارد والـ Spam.",
     authVerifyBad: "رابط التأكيد غير صالح أو منتهي. أعد التسجيل من جديد.",
     authVerifyBtn: "تأكيد",
@@ -310,6 +311,7 @@ const STR = {
     badge: "by",
     disclaimer: "Firas can make mistakes. Check important info.",
     logout: "Log out",
+    settings: "Settings",
     thinkOn: "Thinking on — higher accuracy",
     thinkOff: "Thinking off — faster replies",
     thinkMaxBlocked: "Sorry, Thinking can't be used in Firas Max — it may break the safety limits.",
@@ -415,7 +417,7 @@ const STR = {
     authNewPassword: "New password",
     authResetDone: "Password changed — sign in now.",
     authResetInvalid: "The link is invalid or expired. Request a new one.",
-    authVerifyTitle: "Verify your email",
+    authVerifyTitle: "📧 Check your email",
     authVerifySubtitle: "We sent a verification link to",
     authVerifyWaiting: "Open the link from your email and tap the button — this device will finish automatically (even if you open it on another device). Check your inbox and Spam.",
     authVerifyBad: "The verification link is invalid or expired. Please sign up again.",
@@ -5914,6 +5916,142 @@ async function openAnnouncementsPanel() {
   }
 }
 
+/* ----------------------------------------------------------------------------
+   Account settings panel (account · change email · change password · delete)
+---------------------------------------------------------------------------- */
+function openSettingsPanel() {
+  const ar = state.lang === "ar";
+  const u = state.user || {};
+  const ov = document.createElement("div");
+  ov.className = "mem-overlay settings-overlay";
+  const close = () => { ov.classList.remove("is-open"); setTimeout(() => ov.remove(), 200); };
+
+  const tx = ar ? {
+    title: "الإعدادات", sub: "إدارة حسابك",
+    chEmailH: "تغيير البريد الإلكتروني", newEmail: "البريد الجديد", curPw: "كلمة المرور الحالية", saveEmail: "حفظ البريد",
+    chPwH: "تغيير كلمة المرور", newPw: "كلمة المرور الجديدة (8 أحرف فأكثر)", savePw: "حفظ كلمة المرور",
+    dangerH: "منطقة الخطر", dangerP: "حذف الحساب يمسح جميع محادثاتك نهائياً ولا يمكن التراجع عنه.",
+    delBtn: "حذف حسابي", delConfirmP: "للتأكيد، أدخل كلمة مرورك ثم اضغط «حذف نهائي».", cancel: "إلغاء", delFinal: "حذف نهائي",
+    okEmail: "تم تحديث البريد ✓", okPw: "تم تغيير كلمة المرور ✓", deleted: "تم حذف حسابك", working: "جارٍ…",
+  } : {
+    title: "Settings", sub: "Manage your account",
+    chEmailH: "Change email", newEmail: "New email", curPw: "Current password", saveEmail: "Save email",
+    chPwH: "Change password", newPw: "New password (8+ characters)", savePw: "Save password",
+    dangerH: "Danger zone", dangerP: "Deleting your account erases all your conversations permanently. This can't be undone.",
+    delBtn: "Delete my account", delConfirmP: "To confirm, enter your password then tap “Delete permanently”.", cancel: "Cancel", delFinal: "Delete permanently",
+    okEmail: "Email updated ✓", okPw: "Password changed ✓", deleted: "Your account was deleted", working: "Working…",
+  };
+
+  ov.innerHTML =
+    '<div class="mem-card settings-card" role="dialog" aria-modal="true">' +
+      '<div class="mem-head"><div style="flex:1">' +
+        '<h3>' + tx.title + '</h3><p>' + tx.sub + '</p></div>' +
+        '<button class="mem-x" aria-label="' + (ar ? "إغلاق" : "close") + '"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>' +
+      '</div>' +
+      '<div class="set-body">' +
+        '<section class="set-section set-account">' +
+          '<span class="set-avatar"></span>' +
+          '<div class="set-acct-info"><strong class="set-acct-name"></strong><span class="set-acct-email" dir="ltr"></span></div>' +
+        '</section>' +
+        '<form class="set-section set-form set-email-form" novalidate>' +
+          '<h4>' + tx.chEmailH + '</h4>' +
+          '<input class="set-in set-new-email" type="email" dir="ltr" autocomplete="email" placeholder="' + tx.newEmail + '">' +
+          '<input class="set-in set-email-pw" type="password" dir="ltr" autocomplete="current-password" placeholder="' + tx.curPw + '">' +
+          '<div class="set-err" hidden></div>' +
+          '<button type="submit" class="set-save">' + tx.saveEmail + '</button>' +
+        '</form>' +
+        '<form class="set-section set-form set-pass-form" novalidate>' +
+          '<h4>' + tx.chPwH + '</h4>' +
+          '<input class="set-in set-cur-pw" type="password" dir="ltr" autocomplete="current-password" placeholder="' + tx.curPw + '">' +
+          '<input class="set-in set-new-pw" type="password" dir="ltr" autocomplete="new-password" placeholder="' + tx.newPw + '">' +
+          '<div class="set-err" hidden></div>' +
+          '<button type="submit" class="set-save">' + tx.savePw + '</button>' +
+        '</form>' +
+        '<section class="set-section set-danger">' +
+          '<h4>' + tx.dangerH + '</h4>' +
+          '<p class="set-danger-note">' + tx.dangerP + '</p>' +
+          '<button type="button" class="set-del-btn">' + tx.delBtn + '</button>' +
+          '<div class="set-del-confirm" hidden>' +
+            '<p class="set-danger-note">' + tx.delConfirmP + '</p>' +
+            '<input class="set-in set-del-pw" type="password" dir="ltr" autocomplete="current-password" placeholder="' + tx.curPw + '">' +
+            '<div class="set-err set-del-err" hidden></div>' +
+            '<div class="set-del-row">' +
+              '<button type="button" class="set-del-cancel">' + tx.cancel + '</button>' +
+              '<button type="button" class="set-del-final">' + tx.delFinal + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</section>' +
+      '</div>' +
+    '</div>';
+
+  // identity (textContent — XSS-safe)
+  const name = (u.name && String(u.name).trim()) || (u.email ? String(u.email).split("@")[0] : "Firas");
+  ov.querySelector(".set-avatar").textContent = (name.charAt(0) || "F").toUpperCase();
+  ov.querySelector(".set-acct-name").textContent = name;
+  ov.querySelector(".set-acct-email").textContent = u.email || "";
+
+  const showErr = (el, msg) => { if (el) { el.textContent = msg; el.hidden = false; } };
+  const clrErr = (el) => { if (el) el.hidden = true; };
+
+  document.body.appendChild(ov);
+  setTimeout(() => ov.classList.add("is-open"), 20);
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  ov.querySelector(".mem-x").addEventListener("click", close);
+
+  // — change email —
+  const emailForm = ov.querySelector(".set-email-form");
+  emailForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = emailForm.querySelector(".set-err"); clrErr(err);
+    const email = emailForm.querySelector(".set-new-email").value.trim().toLowerCase();
+    const current = emailForm.querySelector(".set-email-pw").value;
+    if (!email) { showErr(err, ar ? "أدخل البريد الجديد" : "Enter the new email"); return; }
+    const btn = emailForm.querySelector(".set-save"); const lbl = btn.textContent;
+    btn.disabled = true; btn.textContent = tx.working;
+    try {
+      const d = await apiJson("/api/auth/change-email", { method: "POST", body: JSON.stringify({ email, current }) });
+      if (d && d.user) { state.user = Object.assign({}, state.user, d.user); applyUserIdentity(); ov.querySelector(".set-acct-email").textContent = d.user.email || email; }
+      emailForm.reset(); showToast(tx.okEmail);
+    } catch (er) { showErr(err, (er && er.message) || "error"); }
+    finally { btn.disabled = false; btn.textContent = lbl; }
+  });
+
+  // — change password —
+  const passForm = ov.querySelector(".set-pass-form");
+  passForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = passForm.querySelector(".set-err"); clrErr(err);
+    const current = passForm.querySelector(".set-cur-pw").value;
+    const password = passForm.querySelector(".set-new-pw").value;
+    if (password.length < 8) { showErr(err, ar ? "كلمة المرور 8 أحرف على الأقل" : "Password must be 8+ characters"); return; }
+    const btn = passForm.querySelector(".set-save"); const lbl = btn.textContent;
+    btn.disabled = true; btn.textContent = tx.working;
+    try {
+      await apiJson("/api/auth/change-password", { method: "POST", body: JSON.stringify({ current, password }) });
+      passForm.reset(); showToast(tx.okPw);
+    } catch (er) { showErr(err, (er && er.message) || "error"); }
+    finally { btn.disabled = false; btn.textContent = lbl; }
+  });
+
+  // — delete account (two-step, irreversible) —
+  const delBtn = ov.querySelector(".set-del-btn");
+  const delBox = ov.querySelector(".set-del-confirm");
+  delBtn.addEventListener("click", () => { delBox.hidden = false; delBtn.hidden = true; });
+  ov.querySelector(".set-del-cancel").addEventListener("click", () => { delBox.hidden = true; delBtn.hidden = false; });
+  ov.querySelector(".set-del-final").addEventListener("click", async () => {
+    const err = ov.querySelector(".set-del-err"); clrErr(err);
+    const current = ov.querySelector(".set-del-pw").value;
+    const fb = ov.querySelector(".set-del-final"); const lbl = fb.textContent;
+    fb.disabled = true; fb.textContent = tx.working;
+    try {
+      await apiJson("/api/auth/delete-account", { method: "POST", body: JSON.stringify({ current }) });
+      try { if (authChannel) authChannel.postMessage({ type: "logout" }); } catch (_) {}
+      showToast(tx.deleted);
+      setTimeout(() => { try { location.reload(); } catch (_) {} }, 700);
+    } catch (er) { showErr(err, (er && er.message) || "error"); fb.disabled = false; fb.textContent = lbl; }
+  });
+}
+
 /**
  * Regenerate the assistant message at `index` (optionally with a different
  * tier — used by the Ultra upsell). Truncates everything after the preceding
@@ -6276,6 +6414,7 @@ async function handleAuthSubmit(e) {
       _verifyPid = (data && data.pid) || "";
       setAuthMode("verify");
       startVerifyPolling();
+      showToast((state.lang === "ar" ? "📧 أرسلنا إيميل التأكيد إلى " : "📧 Verification email sent to ") + email);
       return;
     }
     const user = (data && data.user) || data || { email };
@@ -6507,6 +6646,7 @@ function cacheEls() {
   els.accountName = $("#accountName");
   els.accountAvatar = $("#accountAvatar");
   els.logoutBtn = $("#logoutBtn");
+  els.settingsBtn = $("#settingsBtn");
   els.notifyBtn = $("#notifyBtn");
   els.notifyBadge = $("#notifyBadge");
 }
@@ -6545,6 +6685,7 @@ function wireEvents() {
 
   // Logout
   els.logoutBtn.addEventListener("click", logout);
+  if (els.settingsBtn) els.settingsBtn.addEventListener("click", openSettingsPanel);
   // Notifications / site updates
   if (els.notifyBtn) els.notifyBtn.addEventListener("click", openAnnouncementsPanel);
 

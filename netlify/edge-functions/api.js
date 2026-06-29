@@ -237,36 +237,59 @@ async function saveUser(u) {
 /* ---------------- email (Resend) + signup verification + password reset ---------------- */
 const RESEND_API_KEY = env("RESEND_API_KEY") || "";
 const RESEND_FROM    = env("RESEND_FROM") || "Firas AI <onboarding@resend.dev>";
+// Brevo (primary): single-sender reaches ALL members for free, no domain needed.
+const BREVO_API_KEY   = env("BREVO_API_KEY") || "";
+const BREVO_FROM      = env("BREVO_FROM") || "firasnozad@gmail.com";
+const BREVO_FROM_NAME = env("BREVO_FROM_NAME") || "Firas AI";
 const VERIFY_TTL_MS  = 15 * 60000;
 const RESET_TTL_MS   = 30 * 60000;
 function appBase(request) { try { return new URL(request.url).origin; } catch (_) { return ""; } }
-async function sendEmail(to, subject, html) {
-  if (!RESEND_API_KEY) return false;
+async function sendViaBrevo(to, subject, html, fromName) {
   try {
-    const r = await fetch("https://api.resend.com/emails", { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + RESEND_API_KEY }, body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, html }) });
+    const r = await fetch("https://api.brevo.com/v3/smtp/email", { method: "POST", headers: { "content-type": "application/json", "accept": "application/json", "api-key": BREVO_API_KEY }, body: JSON.stringify({ sender: { name: fromName || BREVO_FROM_NAME, email: BREVO_FROM }, to: [{ email: to }], subject, htmlContent: html }) });
+    if (!r.ok) { console.error("[firas] Brevo send failed " + r.status); return false; }
+    return true;
+  } catch (e) { console.error("[firas] Brevo error: " + ((e && e.message) || e)); return false; }
+}
+async function sendViaResend(to, subject, html, fromName) {
+  if (!RESEND_API_KEY) return false;
+  const addr = (RESEND_FROM.match(/<([^>]+)>/) || [])[1] || "onboarding@resend.dev";
+  const from = fromName ? (fromName + " <" + addr + ">") : RESEND_FROM;
+  try {
+    const r = await fetch("https://api.resend.com/emails", { method: "POST", headers: { "content-type": "application/json", "Authorization": "Bearer " + RESEND_API_KEY }, body: JSON.stringify({ from, to: [to], subject, html }) });
     if (!r.ok) { console.error("[firas] Resend send failed " + r.status); return false; }
     return true;
   } catch (e) { console.error("[firas] Resend error: " + ((e && e.message) || e)); return false; }
 }
+// Brevo first (reaches everyone free), Resend fallback. opts.fromName overrides display name.
+async function sendEmail(to, subject, html, opts) {
+  const fromName = opts && opts.fromName;
+  if (BREVO_API_KEY) { if (await sendViaBrevo(to, subject, html, fromName)) return true; }
+  if (RESEND_API_KEY) { if (await sendViaResend(to, subject, html, fromName)) return true; }
+  return false;
+}
 function fmtNow() { try { return new Date().toLocaleString("ar", { dateStyle: "long", timeStyle: "short" }); } catch (_) { return new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC"; } }
 function brandedEmail(o) {
-  const bg = "#0d0f0e", card = "#181c1a", border = "#2c322f", ink = "#ECEAE3", muted = "#9aa39f", soft = "#6f7a76", accent = "#2C8A78", accent2 = "#57AE9C";
+  const bg = "#060d0b", card = "#121b18", border = "#2b5950", ink = "#F1EFE8", muted = "#a7b0ab", soft = "#6f7a76", accent = "#2C8A78", accent2 = "#5fc4ae";
   const font = "'Segoe UI',Tahoma,Arial,'Helvetica Neue',sans-serif";
   const time = o.time || fmtNow();
+  const glow = "box-shadow:0 0 0 1px rgba(95,196,174,0.20),0 0 60px rgba(44,138,120,0.55),0 0 26px rgba(95,196,174,0.30);";
   return '<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"></head>' +
-    '<body style="margin:0;padding:0;background:' + bg + ';">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark"></head>' +
+    '<body bgcolor="' + bg + '" style="margin:0;padding:0;background:' + bg + ';">' +
     '<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:' + bg + ';">' + (o.preheader || "") + '</div>' +
-    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:' + bg + ';padding:30px 12px;"><tr><td align="center">' +
-    '<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:' + card + ';border:1px solid ' + border + ';border-radius:18px;overflow:hidden;">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + bg + '" style="background:' + bg + ';padding:34px 12px;"><tr><td align="center">' +
+    '<table role="presentation" width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;"><tr><td style="padding:3px;background:#0c211d;border-radius:22px;' + glow + '">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + card + '" style="background:' + card + ';border:1px solid ' + border + ';border-radius:19px;overflow:hidden;">' +
     '<tr><td style="height:4px;background:' + accent + ';font-size:0;line-height:0;">&nbsp;</td></tr>' +
     '<tr><td style="padding:26px 30px 6px;"><table role="presentation" cellpadding="0" cellspacing="0"><tr>' +
-      '<td style="width:46px;height:46px;border-radius:13px;background:' + accent + ';text-align:center;font:800 24px/46px ' + font + ';color:#ffffff;">F</td>' +
-      '<td style="padding-inline-start:13px;font:800 20px/1 ' + font + ';letter-spacing:2px;color:' + ink + ';">FIRAS<span style="color:' + accent2 + ';"> AI</span></td>' +
+      '<td style="width:48px;height:48px;border-radius:14px;background:' + accent + ';text-align:center;font:800 25px/48px ' + font + ';color:#ffffff;box-shadow:0 0 20px rgba(44,138,120,0.85);">F</td>' +
+      '<td style="padding-inline-start:13px;font:800 21px/1 ' + font + ';letter-spacing:2px;color:' + ink + ';">FIRAS<span style="color:' + accent2 + ';"> AI</span></td>' +
     '</tr></table></td></tr>' +
     '<tr><td style="padding:18px 30px 6px;font-family:' + font + ';color:' + ink + ';">' +
       '<h1 style="margin:0 0 12px;font-size:22px;font-weight:800;color:' + ink + ';">' + o.heading + '</h1>' +
-      '<p style="margin:0 0 20px;font-size:15px;line-height:1.8;color:' + muted + ';">' + o.lead + '</p>' +
+      '<p style="margin:0 0 20px;font-size:15px;line-height:1.85;color:' + muted + ';">' + o.lead + '</p>' +
       o.contentHtml +
       (o.note ? '<p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:' + muted + ';">' + o.note + '</p>' : '') +
     '</td></tr>' +
@@ -276,8 +299,24 @@ function brandedEmail(o) {
       '<p style="margin:0 0 4px;font-size:13px;font-weight:700;letter-spacing:1px;color:' + accent2 + ';">FIRAS AI</p>' +
       '<p style="margin:0;font-size:12px;color:' + soft + ';">مساعدك الذكي · رسالة آلية، لا داعي للرد عليها.</p>' +
     '</td></tr></table>' +
-    '<p style="margin:14px 0 0;font-size:11px;color:#555c59;font-family:' + font + ';">© Firas AI</p>' +
+    '</td></tr></table>' +
+    '<p style="margin:16px 0 0;font-size:11px;color:#4f5754;font-family:' + font + ';">© Firas AI</p>' +
     '</td></tr></table></body></html>';
+}
+function escEmail(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function welcomeEmailHtml(name, link) {
+  const safe = escEmail(String(name || "").trim()) || "صديقي";
+  const p = (t) => '<p style="margin:0 0 14px;font-size:15px;line-height:1.9;color:#cfd6d2;">' + t + '</p>';
+  const btn = '<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:8px auto 2px;"><tr>' +
+    '<td style="border-radius:11px;background:#2C8A78;box-shadow:0 0 22px rgba(44,138,120,0.7);"><a href="' + link + '" style="display:inline-block;padding:14px 34px;font:800 15px \'Segoe UI\',Tahoma,Arial,sans-serif;color:#06120f;text-decoration:none;border-radius:11px;">ابدأ المحادثة الآن</a></td>' +
+    '</tr></table>';
+  const content =
+    p('شكراً لانضمامك إلى <b style="color:#5fc4ae;">Firas AI</b> — حسابك صار جاهزاً ومفعّلاً بالكامل. 🎉') +
+    p('أنا فراس، مطوّر المنصّة. بنيت Firas AI ليكون مساعدك الذكي بالعربية والإنجليزية: محادثة، برمجة، بحث في الإنترنت، توليد صور، وملفات PDF — كله مجاناً، وبأربعة نماذج تختار منها حسب حاجتك.') +
+    p('جرّب نموذج <b style="color:#5fc4ae;">Max</b> الجديد (تجريبي) للأسئلة الصعبة والرياضيات. وإذا واجهت أي مشكلة أو عندك اقتراح، بابي مفتوح دائماً.') +
+    btn +
+    '<p style="margin:24px 0 0;font-size:14px;line-height:1.8;color:#a7b0ab;">مع خالص التقدير،<br><b style="color:#F1EFE8;">فراس</b> · مطوّر Firas AI</p>';
+  return brandedEmail({ preheader: "أهلاً بك في Firas AI — رسالة من فراس", heading: "مرحباً بك يا " + safe + " 👋", lead: "يسعدني انضمامك إلى عائلة Firas AI. هذي رسالة شخصية مني لك:", contentHtml: content });
 }
 function verifyEmailHtml(link) {
   const btn = '<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:6px auto;"><tr>' +
@@ -990,6 +1029,9 @@ export default async (request, context) => {
         // Consume the token so the link can't be replayed; the pid index stays for the
         // original device's cross-device poll, which then cleans up the rest.
         try { await dbDelete("pendingTok/" + token); } catch (_) {}
+        // personal welcome from Firas — don't block sign-in (run after response if possible)
+        const _welcome = sendEmail(user.email, "أهلاً بك في Firas AI 🎉", welcomeEmailHtml(user.name, appBase(request) + "/"), { fromName: "فراس" }).catch(() => {});
+        if (context && typeof context.waitUntil === "function") context.waitUntil(_welcome); else await _welcome;
       }
       if (!user) return json({ error: "تعذّر التأكيد — أعد التسجيل" }, 400);
       await attachSession(context, user.id, request);
@@ -1057,6 +1099,51 @@ export default async (request, context) => {
       await saveUser(user);
       await attachSession(context, user.id, request);
       return json({ ok: true, user: publicUser(user) });
+    }
+
+    if (path === "/api/auth/change-password" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "not authenticated" }, 401);
+      if (rateLimited("acct:" + user.id, 10, 60000)) return json({ error: "too many requests" }, 429);
+      let b; try { b = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+      const current = String(b.current || ""), next = String(b.password || "");
+      if (!user.passHash) return json({ error: "هذا الحساب يسجّل عبر Google ولا يملك كلمة مرور" }, 400);
+      if (next.length < 8) return json({ error: "كلمة المرور يجب أن تكون 8 أحرف على الأقل" }, 400);
+      if (next.length > 200) return json({ error: "كلمة المرور طويلة جداً" }, 400);
+      if (!(await verifyPassword(current, user.passHash))) return json({ error: "كلمة المرور الحالية غير صحيحة" }, 403);
+      user.passHash = await hashPassword(next);
+      await saveUser(user);
+      return json({ ok: true });
+    }
+    if (path === "/api/auth/change-email" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "not authenticated" }, 401);
+      if (rateLimited("acct:" + user.id, 10, 60000)) return json({ error: "too many requests" }, 429);
+      let b; try { b = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+      const current = String(b.current || ""), email = String(b.email || "").trim().toLowerCase();
+      if (!user.passHash) return json({ error: "هذا الحساب يسجّل عبر Google" }, 400);
+      if (!EMAIL_RE.test(email) || email.length > 200) return json({ error: "أدخل بريداً صالحاً" }, 400);
+      if (!(await verifyPassword(current, user.passHash))) return json({ error: "كلمة المرور غير صحيحة" }, 403);
+      if (email === user.email) return json({ error: "هذا هو بريدك الحالي" }, 400);
+      if (await getUserByEmail(email)) return json({ error: "هذا البريد مستخدم بالفعل" }, 409);
+      const oldKey = emailKey(user.email);
+      user.email = email;
+      await saveUser(user);
+      try { await dbDelete("emailIndex/" + oldKey); } catch (_) {}
+      return json({ ok: true, user: publicUser(user) });
+    }
+    if (path === "/api/auth/delete-account" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "not authenticated" }, 401);
+      if (rateLimited("acct:" + user.id, 10, 60000)) return json({ error: "too many requests" }, 429);
+      let b; try { b = await request.json(); } catch { b = {}; }
+      const current = String((b && b.current) || "");
+      if (user.passHash && !(await verifyPassword(current, user.passHash))) return json({ error: "كلمة المرور غير صحيحة" }, 403);
+      try { await dbDelete("chats/" + user.id); } catch (_) {}
+      try { await dbDelete("emailIndex/" + emailKey(user.email)); } catch (_) {}
+      try { await dbDelete("users/" + user.id); } catch (_) {}
+      context.cookies.delete({ name: COOKIE_NAME, path: "/" });
+      return json({ ok: true });
     }
 
     if (path === "/api/auth/logout" && method === "POST") {

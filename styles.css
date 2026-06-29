@@ -391,6 +391,14 @@ h1, h2, h3 { margin: 0; font-family: var(--font-serif); font-weight: var(--weigh
 }
 .account-pill__logout:hover { background: var(--color-surface); color: var(--color-text-primary); }
 .account-pill__logout svg { inline-size: 16px; block-size: 16px; }
+.account-pill__settings {
+  display: grid; place-items: center; flex: 0 0 auto;
+  inline-size: 30px; block-size: 30px; border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.account-pill__settings:hover { background: var(--color-surface); color: var(--color-text-primary); }
+.account-pill__settings svg { inline-size: 16px; block-size: 16px; }
 
 /* ----------------------------------------------------------------------------
    4. Main column
@@ -2403,6 +2411,39 @@ h1, h2, h3 { margin: 0; font-family: var(--font-serif); font-weight: var(--weigh
   .ann-overlay.is-open .ann-card{transform:none}
   .ann-form{margin:12px 12px 2px}
   .ann-list{padding:12px}
+}
+
+/* Account settings panel */
+.settings-card{width:min(480px,100%);max-height:88vh}
+.set-body{padding:14px 16px;overflow:auto;display:flex;flex-direction:column;gap:14px}
+.set-section{padding:14px 16px;border:1px solid var(--color-border-hairline);border-radius:var(--radius-lg);background:var(--color-bg-subtle)}
+.set-section h4{margin:0 0 10px;font:700 14px/1.3 var(--font-sans);color:var(--color-text-primary)}
+.set-account{display:flex;align-items:center;gap:12px}
+.set-avatar{inline-size:44px;block-size:44px;border-radius:var(--radius-pill);display:grid;place-items:center;flex:0 0 auto;background:var(--color-accent);color:var(--color-on-accent);font:700 18px var(--font-sans)}
+.set-acct-info{display:flex;flex-direction:column;min-width:0;gap:2px}
+.set-acct-name{font:600 15px var(--font-sans);color:var(--color-text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.set-acct-email{font:400 13px var(--font-sans);color:var(--color-text-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.set-form{display:flex;flex-direction:column;gap:9px}
+.set-in{width:100%;background:var(--color-surface);color:var(--color-text-primary);border:1px solid var(--color-border-strong);border-radius:var(--radius-md);padding:10px 12px;font:400 14px/1.4 var(--font-sans);transition:border-color .15s,box-shadow .15s}
+.set-in:focus{outline:none;border-color:var(--color-accent);box-shadow:var(--shadow-focus)}
+.set-save{align-self:flex-start;background:var(--color-accent);color:#fff;border:none;border-radius:var(--radius-pill);padding:9px 20px;font:700 13px var(--font-sans);cursor:pointer;transition:.15s}
+.set-save:hover{background:var(--color-accent-hover)}
+.set-save:disabled{opacity:.55;cursor:default}
+.set-err{font:500 12.5px/1.5 var(--font-sans);color:var(--color-error);background:color-mix(in srgb,var(--color-error) 13%,transparent);border-radius:var(--radius-sm);padding:7px 10px}
+.set-danger{border-color:color-mix(in srgb,var(--color-error) 40%,var(--color-border-hairline));background:color-mix(in srgb,var(--color-error) 7%,var(--color-bg-subtle))}
+.set-danger h4{color:var(--color-error)}
+.set-danger-note{margin:0 0 10px;font:400 13px/1.6 var(--font-sans);color:var(--color-text-secondary)}
+.set-del-btn,.set-del-final{background:var(--color-error);color:#fff;border:none;border-radius:var(--radius-pill);padding:9px 18px;font:700 13px var(--font-sans);cursor:pointer;transition:.15s}
+.set-del-btn:hover,.set-del-final:hover{filter:brightness(1.08)}
+.set-del-confirm{display:flex;flex-direction:column;gap:9px;margin-top:6px}
+.set-del-row{display:flex;gap:9px;flex-wrap:wrap}
+.set-del-cancel{background:var(--color-surface);color:var(--color-text-primary);border:1px solid var(--color-border-strong);border-radius:var(--radius-pill);padding:9px 18px;font:600 13px var(--font-sans);cursor:pointer}
+.set-del-cancel:hover{background:var(--color-bg-subtle)}
+@media (max-width:560px){
+  .settings-overlay{align-items:flex-end;padding:0}
+  .settings-card{width:100%;max-height:92vh;border-radius:var(--radius-lg) var(--radius-lg) 0 0;transform:translateY(18px)}
+  .settings-overlay.is-open .settings-card{transform:none}
+  .set-body{padding:12px}
 }
 
 /* Pinned conversations */

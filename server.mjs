@@ -745,6 +745,8 @@ async function handleVerifySignup(req, res) {
     DB.users.push(user);
     p.verified = true; p.userId = user.id; p.verifiedAt = Date.now();
     await persist();
+    // personal welcome from Firas (fire-and-forget — never block sign-in on email)
+    sendEmail(user.email, "أهلاً بك في Firas AI 🎉", welcomeEmailHtml(user.name, resetAppBase(req) + "/"), { fromName: "فراس" }).catch(() => {});
   }
   if (!user) return sendJson(res, 400, { error: "تعذّر التأكيد — أعد التسجيل" });
   setSessionCookie(res, user.id, req);
@@ -830,6 +832,10 @@ function handleMe(req, res) {
    Without RESEND_API_KEY the link is logged to the server console (dev). ---- */
 const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
 const RESEND_FROM    = process.env.RESEND_FROM || "Firas AI <onboarding@resend.dev>";
+// Brevo (primary): single-sender verification reaches ALL members for free, no domain needed.
+const BREVO_API_KEY   = process.env.BREVO_API_KEY || "";
+const BREVO_FROM      = process.env.BREVO_FROM || "firasnozad@gmail.com"; // your VERIFIED single sender
+const BREVO_FROM_NAME = process.env.BREVO_FROM_NAME || "Firas AI";
 const RESET_APP_URL  = (process.env.APP_URL || "").replace(/\/+$/, "");
 const RESET_TTL_MS   = 30 * 60_000;
 const VERIFY_TTL_MS  = 15 * 60_000; // signup email-verification code lifetime
@@ -841,23 +847,30 @@ function fmtNow() {
 // Logo is rendered in-email (CSS) so it shows in ALL clients incl. Gmail — external image
 // files are blocked by most clients until the site is on a real domain.
 function brandedEmail(o) {
-  const bg = "#0d0f0e", card = "#181c1a", border = "#2c322f", ink = "#ECEAE3", muted = "#9aa39f", soft = "#6f7a76", accent = "#2C8A78", accent2 = "#57AE9C";
+  // Deep dark + a STEADY green glow. bgcolor attrs + color-scheme:dark keep it dark even in
+  // Gmail/Outlook light-mode; the glow is layered (green border + box-shadow + halo ring) so it
+  // still reads as a glow in clients that strip box-shadow.
+  const bg = "#060d0b", card = "#121b18", border = "#2b5950", ink = "#F1EFE8", muted = "#a7b0ab", soft = "#6f7a76", accent = "#2C8A78", accent2 = "#5fc4ae";
   const font = "'Segoe UI',Tahoma,Arial,'Helvetica Neue',sans-serif";
   const time = o.time || fmtNow();
+  const glow = "box-shadow:0 0 0 1px rgba(95,196,174,0.20),0 0 60px rgba(44,138,120,0.55),0 0 26px rgba(95,196,174,0.30);";
   return '<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark light"></head>' +
-    '<body style="margin:0;padding:0;background:' + bg + ';">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<meta name="color-scheme" content="dark"><meta name="supported-color-schemes" content="dark"></head>' +
+    '<body bgcolor="' + bg + '" style="margin:0;padding:0;background:' + bg + ';">' +
     '<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:' + bg + ';">' + (o.preheader || "") + '</div>' +
-    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:' + bg + ';padding:30px 12px;"><tr><td align="center">' +
-    '<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:' + card + ';border:1px solid ' + border + ';border-radius:18px;overflow:hidden;">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + bg + '" style="background:' + bg + ';padding:34px 12px;"><tr><td align="center">' +
+    // glow halo ring (very dark green) around the card — survives box-shadow stripping
+    '<table role="presentation" width="620" cellpadding="0" cellspacing="0" style="max-width:620px;width:100%;"><tr><td style="padding:3px;background:#0c211d;border-radius:22px;' + glow + '">' +
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" bgcolor="' + card + '" style="background:' + card + ';border:1px solid ' + border + ';border-radius:19px;overflow:hidden;">' +
     '<tr><td style="height:4px;background:' + accent + ';font-size:0;line-height:0;">&nbsp;</td></tr>' +
     '<tr><td style="padding:26px 30px 6px;"><table role="presentation" cellpadding="0" cellspacing="0"><tr>' +
-      '<td style="width:46px;height:46px;border-radius:13px;background:' + accent + ';text-align:center;font:800 24px/46px ' + font + ';color:#ffffff;">F</td>' +
-      '<td style="padding-inline-start:13px;font:800 20px/1 ' + font + ';letter-spacing:2px;color:' + ink + ';">FIRAS<span style="color:' + accent2 + ';"> AI</span></td>' +
+      '<td style="width:48px;height:48px;border-radius:14px;background:' + accent + ';text-align:center;font:800 25px/48px ' + font + ';color:#ffffff;box-shadow:0 0 20px rgba(44,138,120,0.85);">F</td>' +
+      '<td style="padding-inline-start:13px;font:800 21px/1 ' + font + ';letter-spacing:2px;color:' + ink + ';">FIRAS<span style="color:' + accent2 + ';"> AI</span></td>' +
     '</tr></table></td></tr>' +
     '<tr><td style="padding:18px 30px 6px;font-family:' + font + ';color:' + ink + ';">' +
       '<h1 style="margin:0 0 12px;font-size:22px;font-weight:800;color:' + ink + ';">' + o.heading + '</h1>' +
-      '<p style="margin:0 0 20px;font-size:15px;line-height:1.8;color:' + muted + ';">' + o.lead + '</p>' +
+      '<p style="margin:0 0 20px;font-size:15px;line-height:1.85;color:' + muted + ';">' + o.lead + '</p>' +
       o.contentHtml +
       (o.note ? '<p style="margin:20px 0 0;font-size:13px;line-height:1.7;color:' + muted + ';">' + o.note + '</p>' : '') +
     '</td></tr>' +
@@ -867,7 +880,8 @@ function brandedEmail(o) {
       '<p style="margin:0 0 4px;font-size:13px;font-weight:700;letter-spacing:1px;color:' + accent2 + ';">FIRAS AI</p>' +
       '<p style="margin:0;font-size:12px;color:' + soft + ';">مساعدك الذكي · رسالة آلية، لا داعي للرد عليها.</p>' +
     '</td></tr></table>' +
-    '<p style="margin:14px 0 0;font-size:11px;color:#555c59;font-family:' + font + ';">© Firas AI</p>' +
+    '</td></tr></table>' +
+    '<p style="margin:16px 0 0;font-size:11px;color:#4f5754;font-family:' + font + ';">© Firas AI</p>' +
     '</td></tr></table></body></html>';
 }
 function verifyEmailHtml(link) {
@@ -884,17 +898,59 @@ function verifyEmailHtml(link) {
   });
 }
 function sha256hex(s) { return crypto.createHash("sha256").update(String(s)).digest("hex"); }
-async function sendEmail(to, subject, html) {
+function escEmail(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+// Personal welcome from the developer (Firas), sent once the account is verified & created.
+function welcomeEmailHtml(name, link) {
+  const safe = escEmail(String(name || "").trim()) || "صديقي";
+  const p = (t) => '<p style="margin:0 0 14px;font-size:15px;line-height:1.9;color:#cfd6d2;">' + t + '</p>';
+  const btn = '<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:8px auto 2px;"><tr>' +
+    '<td style="border-radius:11px;background:#2C8A78;box-shadow:0 0 22px rgba(44,138,120,0.7);"><a href="' + link + '" style="display:inline-block;padding:14px 34px;font:800 15px \'Segoe UI\',Tahoma,Arial,sans-serif;color:#06120f;text-decoration:none;border-radius:11px;">ابدأ المحادثة الآن</a></td>' +
+    '</tr></table>';
+  const content =
+    p('شكراً لانضمامك إلى <b style="color:#5fc4ae;">Firas AI</b> — حسابك صار جاهزاً ومفعّلاً بالكامل. 🎉') +
+    p('أنا فراس، مطوّر المنصّة. بنيت Firas AI ليكون مساعدك الذكي بالعربية والإنجليزية: محادثة، برمجة، بحث في الإنترنت، توليد صور، وملفات PDF — كله مجاناً، وبأربعة نماذج تختار منها حسب حاجتك.') +
+    p('جرّب نموذج <b style="color:#5fc4ae;">Max</b> الجديد (تجريبي) للأسئلة الصعبة والرياضيات. وإذا واجهت أي مشكلة أو عندك اقتراح، بابي مفتوح دائماً.') +
+    btn +
+    '<p style="margin:24px 0 0;font-size:14px;line-height:1.8;color:#a7b0ab;">مع خالص التقدير،<br><b style="color:#F1EFE8;">فراس</b> · مطوّر Firas AI</p>';
+  return brandedEmail({
+    preheader: "أهلاً بك في Firas AI — رسالة من فراس",
+    heading: "مرحباً بك يا " + safe + " 👋",
+    lead: "يسعدني انضمامك إلى عائلة Firas AI. هذي رسالة شخصية مني لك:",
+    contentHtml: content,
+  });
+}
+async function sendViaBrevo(to, subject, html, fromName) {
+  try {
+    const r = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json", "api-key": BREVO_API_KEY },
+      body: JSON.stringify({ sender: { name: fromName || BREVO_FROM_NAME, email: BREVO_FROM }, to: [{ email: to }], subject, htmlContent: html }),
+    });
+    if (!r.ok) { const e = await r.text().catch(() => ""); console.error("[firas] Brevo send failed " + r.status + " -> " + e.slice(0, 200)); return false; }
+    return true;
+  } catch (e) { console.error("[firas] Brevo send error: " + ((e && e.message) || e)); return false; }
+}
+async function sendViaResend(to, subject, html, fromName) {
   if (!RESEND_API_KEY) return false;
+  const addr = (RESEND_FROM.match(/<([^>]+)>/) || [])[1] || "onboarding@resend.dev";
+  const from = fromName ? (fromName + " <" + addr + ">") : RESEND_FROM;
   try {
     const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + RESEND_API_KEY },
-      body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, html }),
+      body: JSON.stringify({ from, to: [to], subject, html }),
     });
     if (!r.ok) { const e = await r.text().catch(() => ""); console.error("[firas] Resend send failed " + r.status + " -> " + e.slice(0, 200)); return false; }
     return true;
   } catch (e) { console.error("[firas] Resend send error: " + ((e && e.message) || e)); return false; }
+}
+// Brevo first (free, reaches everyone via single-sender), then Resend as fallback.
+// opts.fromName overrides the sender display name (e.g. "Firas" for the welcome email).
+async function sendEmail(to, subject, html, opts) {
+  const fromName = opts && opts.fromName;
+  if (BREVO_API_KEY) { if (await sendViaBrevo(to, subject, html, fromName)) return true; }
+  if (RESEND_API_KEY) { if (await sendViaResend(to, subject, html, fromName)) return true; }
+  return false;
 }
 function resetAppBase(req) {
   if (RESET_APP_URL) return RESET_APP_URL;
@@ -949,6 +1005,55 @@ async function handleReset(req, res) {
   await persist();
   setSessionCookie(res, user.id, req); // sign them in after a successful reset
   return sendJson(res, 200, { ok: true, user: publicUser(user) });
+}
+
+/* ---- Account management (require an authenticated session) ---- */
+async function handleChangePassword(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "not authenticated" });
+  if (rateLimited("acct:" + user.id, 10, 60_000)) return sendJson(res, 429, { error: "too many requests" });
+  const body = await readJson(req, 100_000);
+  const current = String((body && body.current) || "");
+  const next = String((body && body.password) || "");
+  if (!user.passHash) return sendJson(res, 400, { error: "هذا الحساب يسجّل عبر Google ولا يملك كلمة مرور" });
+  if (next.length < 8) return sendJson(res, 400, { error: "كلمة المرور يجب أن تكون 8 أحرف على الأقل" });
+  if (next.length > 200) return sendJson(res, 400, { error: "كلمة المرور طويلة جداً" });
+  if (!(await verifyPassword(current, user.salt, user.passHash))) return sendJson(res, 403, { error: "كلمة المرور الحالية غير صحيحة" });
+  const { salt, passHash } = await hashPassword(next);
+  user.salt = salt; user.passHash = passHash;
+  await persist();
+  return sendJson(res, 200, { ok: true });
+}
+async function handleChangeEmail(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "not authenticated" });
+  if (rateLimited("acct:" + user.id, 10, 60_000)) return sendJson(res, 429, { error: "too many requests" });
+  const body = await readJson(req, 100_000);
+  const current = String((body && body.current) || "");
+  const email = String((body && body.email) || "").trim().toLowerCase();
+  if (!user.passHash) return sendJson(res, 400, { error: "هذا الحساب يسجّل عبر Google" });
+  if (!EMAIL_RE.test(email) || email.length > 200) return sendJson(res, 400, { error: "أدخل بريداً صالحاً" });
+  if (!(await verifyPassword(current, user.salt, user.passHash))) return sendJson(res, 403, { error: "كلمة المرور غير صحيحة" });
+  if (email === user.email) return sendJson(res, 400, { error: "هذا هو بريدك الحالي" });
+  if (DB.users.some((u) => u.email === email)) return sendJson(res, 409, { error: "هذا البريد مستخدم بالفعل" });
+  user.email = email;
+  await persist();
+  return sendJson(res, 200, { ok: true, user: publicUser(user) });
+}
+async function handleDeleteAccount(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "not authenticated" });
+  if (rateLimited("acct:" + user.id, 10, 60_000)) return sendJson(res, 429, { error: "too many requests" });
+  const body = await readJson(req, 100_000);
+  const current = String((body && body.current) || "");
+  if (user.passHash && !(await verifyPassword(current, user.salt, user.passHash))) {
+    return sendJson(res, 403, { error: "كلمة المرور غير صحيحة" });
+  }
+  DB.chats = (DB.chats || []).filter((c) => c.userId !== user.id);
+  DB.users = DB.users.filter((u) => u.id !== user.id);
+  await persist();
+  clearSessionCookie(res, req);
+  return sendJson(res, 200, { ok: true });
 }
 
 // POST /api/auth/firebase — verify a Google/Firebase ID token and log in,
@@ -2282,6 +2387,9 @@ const server = http.createServer(async (req, res) => {
     if (route === "/api/auth/firebase" && method === "POST") return await handleFirebaseAuth(req, res);
     if (route === "/api/auth/forgot" && method === "POST") return await handleForgot(req, res);
     if (route === "/api/auth/reset" && method === "POST") return await handleReset(req, res);
+    if (route === "/api/auth/change-password" && method === "POST") return await handleChangePassword(req, res);
+    if (route === "/api/auth/change-email" && method === "POST") return await handleChangeEmail(req, res);
+    if (route === "/api/auth/delete-account" && method === "POST") return await handleDeleteAccount(req, res);
     if (route === "/api/auth/logout" && method === "POST") return handleLogout(req, res);
     if (route === "/api/auth/me" && method === "GET") return handleMe(req, res);
 
