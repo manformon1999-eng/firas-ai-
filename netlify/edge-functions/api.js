@@ -68,13 +68,21 @@ const CF_IMAGE_STEPS = Math.min(20, Math.max(1, parseInt(env("CF_IMAGE_STEPS") |
 // CF_API_TOKEN + any pairs in CF_ACCOUNTS ("id:token,id:token"). (Pooling to bypass a free
 // tier may breach Cloudflare's ToS — operator's choice.)
 const CF_ACCOUNTS = (() => {
-  const list = [];
-  if (CF_ACCOUNT_ID && CF_API_TOKEN) list.push({ id: CF_ACCOUNT_ID, token: CF_API_TOKEN });
+  const list = [], seen = new Set();
+  const add = (id, token) => {
+    id = String(id || "").trim(); token = String(token || "").trim();
+    if (id && token && !seen.has(id)) { seen.add(id); list.push({ id, token }); }
+  };
+  // 1) Primary (unnumbered) pair.
+  add(CF_ACCOUNT_ID, CF_API_TOKEN);
+  // 2) NUMBERED pairs: CF_ACCOUNT_ID_1 + CF_API_TOKEN_1, _2, _3 … add as many as you want;
+  //    only the pairs actually set are used, and the engine rotates/falls over between them.
+  for (let i = 1; i <= 64; i++) add(env("CF_ACCOUNT_ID_" + i), env("CF_API_TOKEN_" + i));
+  // 3) Legacy combined string "id:token,id:token,…".
   for (const pair of (env("CF_ACCOUNTS") || "").split(",")) {
     const s = pair.trim(); if (!s) continue;
     const i = s.indexOf(":"); if (i < 1) continue;
-    const id = s.slice(0, i).trim(), token = s.slice(i + 1).trim();
-    if (id && token) list.push({ id, token });
+    add(s.slice(0, i), s.slice(i + 1));
   }
   return list;
 })();
@@ -728,13 +736,18 @@ async function cfTryAccount(acct, prompt, w, h) {
   } catch (_) { return null; }
   finally { clearTimeout(to); }
 }
-// Try each pooled account in turn; skip those in 429 cooldown. Returns {bytes,mime} or null.
+// Round-robin across pooled accounts (spreads load), skipping any in 429 cooldown and
+// falling over to the next on failure. Returns {bytes,mime} or null.
+let _cfNext = 0;
 async function generateImageCloudflare(prompt, w, h) {
-  for (const acct of CF_ACCOUNTS) {
+  const n = CF_ACCOUNTS.length;
+  if (!n) return null;
+  for (let k = 0; k < n; k++) {
+    const acct = CF_ACCOUNTS[(_cfNext + k) % n];
     if (Date.now() < (_cfCooldown.get(acct.id) || 0)) continue;
     const out = await cfTryAccount(acct, prompt, w, h);
     if (out === "429") { _cfCooldown.set(acct.id, Date.now() + 30 * 60000); continue; }
-    if (out && out.bytes && out.bytes.length) return out;
+    if (out && out.bytes && out.bytes.length) { _cfNext = (_cfNext + k + 1) % n; return out; }
   }
   return null;
 }

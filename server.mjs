@@ -1282,13 +1282,21 @@ function sniffImageMime(buf) {
 // request tries them in order, skipping any in a 429 cooldown. NOTE: pooling many accounts
 // to bypass a free tier may breach Cloudflare's ToS — the operator's choice.
 const CF_ACCOUNTS = (() => {
-  const list = [];
-  if (CF_ACCOUNT_ID && CF_API_TOKEN) list.push({ id: CF_ACCOUNT_ID, token: CF_API_TOKEN });
+  const list = [], seen = new Set();
+  const add = (id, token) => {
+    id = String(id || "").trim(); token = String(token || "").trim();
+    if (id && token && !seen.has(id)) { seen.add(id); list.push({ id, token }); }
+  };
+  // 1) Primary (unnumbered) pair.
+  add(CF_ACCOUNT_ID, CF_API_TOKEN);
+  // 2) NUMBERED pairs: CF_ACCOUNT_ID_1 + CF_API_TOKEN_1, _2, _3 … add as many as you want;
+  //    only the pairs actually set are used, and the engine rotates/falls over between them.
+  for (let i = 1; i <= 64; i++) add(process.env["CF_ACCOUNT_ID_" + i], process.env["CF_API_TOKEN_" + i]);
+  // 3) Legacy combined string "id:token,id:token,…".
   for (const pair of (process.env.CF_ACCOUNTS || "").split(",")) {
     const s = pair.trim(); if (!s) continue;
     const i = s.indexOf(":"); if (i < 1) continue;
-    const id = s.slice(0, i).trim(), token = s.slice(i + 1).trim();
-    if (id && token) list.push({ id, token });
+    add(s.slice(0, i), s.slice(i + 1));
   }
   return list;
 })();
@@ -1336,12 +1344,16 @@ async function cfTryAccount(acct, prompt, w, h) {
 }
 
 // Try each pooled account in turn; skip those in 429 cooldown. Returns {buf,mime} or null.
+let _cfNext = 0; // round-robin cursor → spreads load across accounts (not always account #1)
 async function generateImageCloudflare(prompt, w, h) {
-  for (const acct of CF_ACCOUNTS) {
-    if (Date.now() < (_cfCooldown.get(acct.id) || 0)) continue;
+  const n = CF_ACCOUNTS.length;
+  if (!n) return null;
+  for (let k = 0; k < n; k++) {
+    const acct = CF_ACCOUNTS[(_cfNext + k) % n];
+    if (Date.now() < (_cfCooldown.get(acct.id) || 0)) continue; // in 429 cooldown → skip
     const out = await cfTryAccount(acct, prompt, w, h);
     if (out === "429") { _cfCooldown.set(acct.id, Date.now() + 30 * 60_000); continue; } // exhausted → next account
-    if (out && out.buf && out.buf.length) return out;
+    if (out && out.buf && out.buf.length) { _cfNext = (_cfNext + k + 1) % n; return out; } // advance cursor for next call
     // other failure → try the next account
   }
   return null;
