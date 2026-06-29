@@ -4336,6 +4336,16 @@ function buildMessages(tier, conversation, replyLang) {
     "language's dominant style (PEP 8, idiomatic Go, modern ES). When it adds value, include a few " +
     "illustrative usage examples or self-checks. ALWAYS strive to satisfy the user: anticipate their " +
     "real needs, go the extra mile, polish the details, and deliver something you'd be proud to ship.";
+  const codeRule =
+    " CODE FORMATTING — ALWAYS FENCE CODE: put EVERY piece of source code, in ANY programming " +
+    "language (Python, JavaScript, TypeScript, C, C++, C#, Java, Go, Rust, SQL, HTML, CSS, PHP, " +
+    "Ruby, Swift, Kotlin, Bash, etc.), inside a Markdown fenced code block that OPENS with three " +
+    "backticks immediately followed by the language name and CLOSES with three backticks on their " +
+    "own line — e.g. ```python … ``` or ```js … ```. This is MANDATORY for every snippet, function, " +
+    "script, or file you show, no matter how short. NEVER write multi-line code as plain text, as " +
+    "indented text, or inline, and NEVER omit the closing fence. Put terminal/shell commands in a " +
+    "```bash block. Use single backticks ONLY for a short inline token (a variable, function, or file " +
+    "name) inside a sentence — never for a whole snippet or a multi-line block.";
   const accuracyRule =
     " ACCURACY — DO NOT FABRICATE: never invent facts, especially recent events, sports scores/results, " +
     "match line-ups, goalscorers, statistics, prices, or dates. If WEB SEARCH RESULTS are provided, rely on them " +
@@ -4349,7 +4359,7 @@ function buildMessages(tier, conversation, replyLang) {
   const planning = state.mode === "plan";
   const system = {
     role: "system",
-    content: model.persona + identityRule + langRule + mathRule + accuracyRule + (planning ? "" : buildRule + engineerRule),
+    content: model.persona + identityRule + langRule + mathRule + accuracyRule + codeRule + (planning ? "" : buildRule + engineerRule),
   };
 
   // PLAN MODE: a per-turn system message (inserted right after the persona).
