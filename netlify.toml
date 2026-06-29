@@ -12,6 +12,22 @@
   path = "/api/*"
   function = "api"
 
+# Firebase auth proxy: serve the Google sign-in handler from OUR OWN domain so the auth
+# flow is FIRST-PARTY. This is what makes "Continue with Google" work in Safari — its
+# tracking prevention (ITP) blocks the cross-domain firebaseapp.com handler. firebase-config.js
+# sets authDomain to this site's own host; these rewrites forward the handler to Firebase.
+[[redirects]]
+  from = "/__/auth/*"
+  to = "https://firas-ai.firebaseapp.com/__/auth/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/__/firebase/*"
+  to = "https://firas-ai.firebaseapp.com/__/firebase/:splat"
+  status = 200
+  force = true
+
 # Static files serve automatically for every non-/api path — all routes are real
 # files (/, /index.html, /app.js, /styles.css, /firebase-config.js). The edge
 # function intercepts every /api/* request and returns 404 for unknown api paths.
