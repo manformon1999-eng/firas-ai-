@@ -309,6 +309,10 @@ function normalizeDb(parsed) {
   return {
     users: arr(parsed && parsed.users),
     chats: arr(parsed && parsed.chats),
+    // announcements MUST persist across restarts (admin posts them once for everyone);
+    // pending signups are transient but harmless to carry over (a sweep drops expired ones).
+    announcements: arr(parsed && parsed.announcements),
+    pending: (parsed && parsed.pending && typeof parsed.pending === "object" && !Array.isArray(parsed.pending)) ? parsed.pending : {},
     secret: parsed && typeof parsed.secret === "string" ? parsed.secret : "",
   };
 }
@@ -1394,6 +1398,54 @@ function stripEngineAd(text) {
   return t.replace(/\s+$/, "");
 }
 
+// One-shot, non-streaming translation (keyless pollinations OpenAI-compat). Used for the
+// AR/EN toggle on announcements. Falls back to the original text on any failure.
+async function translateText(text, toLangName) {
+  const sys = "You are a professional translator. Translate the user's text into " + toLangName +
+    ". Output ONLY the translation — preserve line breaks, formatting and emoji, keep brand/product names as-is. No notes, no quotes.";
+  const r = await fetch(FALLBACK_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "openai-fast", messages: [{ role: "system", content: sys }, { role: "user", content: text }], stream: false, temperature: 0.2 }),
+  });
+  if (!r.ok) throw new Error("translate " + r.status);
+  const j = await r.json();
+  const out = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+  return stripEngineAd(String(out || "")).trim();
+}
+// Translate a title + body together in ONE upstream call (avoids concurrent-call failures and
+// is faster), parsing them back out via sentinel markers.
+async function translatePair(title, bodyText, toLangName) {
+  const sys = "You are a professional translator. Translate the update below into " + toLangName +
+    ". Keep brand/product names as-is, preserve line breaks and emoji. Respond in EXACTLY this format and nothing else:\n<<<TITLE>>>\n{translated title}\n<<<BODY>>>\n{translated body}";
+  const usr = "<<<TITLE>>>\n" + (title || "") + "\n<<<BODY>>>\n" + (bodyText || "");
+  const r = await fetch(FALLBACK_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "openai-fast", messages: [{ role: "system", content: sys }, { role: "user", content: usr }], stream: false, temperature: 0.2 }) });
+  if (!r.ok) throw new Error("translate " + r.status);
+  const j = await r.json();
+  const out = stripEngineAd(String((j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || ""));
+  const tm = out.indexOf("<<<TITLE>>>"), bm = out.indexOf("<<<BODY>>>");
+  if (tm !== -1 && bm !== -1 && bm > tm) return { title: out.slice(tm + 11, bm).trim(), body: out.slice(bm + 10).trim() };
+  return { title, body: out.trim() || bodyText };
+}
+async function handleTranslate(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "not authenticated" });
+  if (rateLimited("translate:" + user.id, 40, 60_000)) return sendJson(res, 429, { error: "too many requests" });
+  const body = await readJson(req, 200_000);
+  const to = String((body && body.to) || "").toLowerCase() === "en" ? "English" : "Arabic";
+  if (body && (typeof body.title === "string" || typeof body.body === "string")) {
+    const title = String(body.title || "").slice(0, 400);
+    const btext = String(body.body || "").slice(0, 8000);
+    if (!title.trim() && !btext.trim()) return sendJson(res, 200, { title: "", body: "" });
+    try { return sendJson(res, 200, await translatePair(title, btext, to)); }
+    catch (_) { return sendJson(res, 200, { title, body: btext }); }
+  }
+  const text = String((body && body.text) || "").slice(0, 8000);
+  if (!text.trim()) return sendJson(res, 200, { text: "" });
+  try { const out = await translateText(text, to); return sendJson(res, 200, { text: out || text }); }
+  catch (_) { return sendJson(res, 200, { text }); }
+}
+
 /* ---------------------------------------------------------------------------
    Web search — keyless, server-side DuckDuckGo proxy. Returns up to 6 results
    as { title, url, snippet }. Done server-side to dodge browser CORS/Turnstile.
@@ -2222,6 +2274,25 @@ async function handleAnnouncementsDelete(req, res) {
   if (i >= 0) { list.splice(i, 1); await persist(); }
   return sendJson(res, 200, { ok: true });
 }
+async function handleAnnouncementsPatch(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "authentication required" });
+  if (!isAdmin(user)) return sendJson(res, 403, { error: "admins only" });
+  let p; try { p = JSON.parse((await readBody(req, CHAT_BODY_LIMIT)) || "{}"); } catch { return sendJson(res, 400, { error: "invalid JSON" }); }
+  const item = announcementsList().find((a) => a.id === String(p.id || ""));
+  if (!item) return sendJson(res, 404, { error: "not found" });
+  if (typeof p.title === "string") item.title = p.title.slice(0, 200).trim();
+  if (typeof p.body === "string") item.body = p.body.slice(0, 4000).trim();
+  if (typeof p.image === "string") {
+    let image = p.image.trim();
+    if (image && !ANN_IMG_OK(image)) image = "";
+    if (image.length > 600000) return sendJson(res, 413, { error: "image too large" });
+    item.image = image; // "" removes the image
+  }
+  item.editedTs = Date.now();
+  await persist();
+  return sendJson(res, 200, { ok: true, announcement: item });
+}
 
 async function handleChat(req, res) {
   // AUTH REQUIRED.
@@ -2398,7 +2469,9 @@ const server = http.createServer(async (req, res) => {
     if (route === "/api/memory/learn" && method === "POST") return await handleMemoryLearn(req, res);
     if (route === "/api/announcements" && method === "GET") return handleAnnouncementsGet(req, res);
     if (route === "/api/announcements" && method === "POST") return await handleAnnouncementsPost(req, res);
+    if (route === "/api/announcements" && method === "PATCH") return await handleAnnouncementsPatch(req, res);
     if (route === "/api/announcements" && method === "DELETE") return await handleAnnouncementsDelete(req, res);
+    if (route === "/api/translate" && method === "POST") return await handleTranslate(req, res);
 
     // ---- Build version (lets an open tab auto-reload when code changes) ----
     if (route === "/api/version" && method === "GET") return handleVersion(req, res);

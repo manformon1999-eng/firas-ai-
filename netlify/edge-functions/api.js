@@ -1310,6 +1310,26 @@ export default async (request, context) => {
       try { await dbPut("announcements/" + id, item); } catch (_) {}
       return json({ ok: true, announcement: item });
     }
+    if (path === "/api/announcements" && method === "PATCH") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "authentication required" }, 401);
+      if (!isAdmin(user)) return json({ error: "admins only" }, 403);
+      let p; try { p = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+      const id = String(p.id || "");
+      const item = await dbGet("announcements/" + id);
+      if (!item) return json({ error: "not found" }, 404);
+      if (typeof p.title === "string") item.title = p.title.slice(0, 200).trim();
+      if (typeof p.body === "string") item.body = p.body.slice(0, 4000).trim();
+      if (typeof p.image === "string") {
+        let image = p.image.trim();
+        if (image && !ANN_IMG_OK(image)) image = "";
+        if (image.length > 600000) return json({ error: "image too large" }, 413);
+        item.image = image;
+      }
+      item.editedTs = Date.now();
+      try { await dbPut("announcements/" + id, item); } catch (_) {}
+      return json({ ok: true, announcement: item });
+    }
     if (path === "/api/announcements" && method === "DELETE") {
       const user = await currentUser(context);
       if (!user) return json({ error: "authentication required" }, 401);
@@ -1317,6 +1337,30 @@ export default async (request, context) => {
       const id = url.searchParams.get("id");
       if (id) { try { await dbPut("announcements/" + id, null); } catch (_) {} }
       return json({ ok: true });
+    }
+    if (path === "/api/translate" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "not authenticated" }, 401);
+      if (rateLimited("translate:" + user.id, 40, 60000)) return json({ error: "too many requests" }, 429);
+      let p; try { p = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+      const toName = String(p.to || "").toLowerCase() === "en" ? "English" : "Arabic";
+      if (typeof p.title === "string" || typeof p.body === "string") {
+        const title = String(p.title || "").slice(0, 400), btext = String(p.body || "").slice(0, 8000);
+        if (!title.trim() && !btext.trim()) return json({ title: "", body: "" });
+        const sys = "You are a professional translator. Translate the update below into " + toName + ". Keep brand/product names as-is, preserve line breaks and emoji. Respond in EXACTLY this format and nothing else:\n<<<TITLE>>>\n{translated title}\n<<<BODY>>>\n{translated body}";
+        const usr = "<<<TITLE>>>\n" + title + "\n<<<BODY>>>\n" + btext;
+        try {
+          const out = stripEngineAd(String(await llmComplete([{ role: "system", content: sys }, { role: "user", content: usr }], 1500, 0.2) || ""));
+          const tm = out.indexOf("<<<TITLE>>>"), bm = out.indexOf("<<<BODY>>>");
+          if (tm !== -1 && bm !== -1 && bm > tm) return json({ title: out.slice(tm + 11, bm).trim(), body: out.slice(bm + 10).trim() });
+          return json({ title, body: out.trim() || btext });
+        } catch (_) { return json({ title, body: btext }); }
+      }
+      const text = String(p.text || "").slice(0, 8000);
+      if (!text.trim()) return json({ text: "" });
+      const sys = "You are a professional translator. Translate the user's text into " + toName + ". Output ONLY the translation — preserve line breaks, formatting and emoji, keep brand/product names as-is. No notes, no quotes.";
+      try { const out = stripEngineAd(String(await llmComplete([{ role: "system", content: sys }, { role: "user", content: text }], 1500, 0.2) || "")).trim(); return json({ text: out || text }); }
+      catch (_) { return json({ text }); }
     }
 
     /* ---- image generation proxy (charge on success by cid) ---- */

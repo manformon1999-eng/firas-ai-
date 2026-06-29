@@ -5804,8 +5804,8 @@ function updateNotifyBadge() {
   if (!els.notifyBadge) return;
   const seen = annLastSeen();
   const unread = annCache.filter((a) => (a.ts || 0) > seen).length;
-  if (unread > 0) { els.notifyBadge.textContent = unread > 9 ? "9+" : String(unread); els.notifyBadge.hidden = false; }
-  else els.notifyBadge.hidden = true;
+  els.notifyBadge.textContent = "";            // it's a green DOT now (styled in CSS), not a count
+  els.notifyBadge.hidden = unread === 0;
 }
 const annImgOk = (s) => typeof s === "string" && /^(data:image\/(png|jpe?g|webp);base64,|https?:\/\/)/.test(s);
 // Downscale a picked image to a small JPEG data URL so it stores/syncs cheaply.
@@ -5831,6 +5831,23 @@ function annDate(ts, ar) {
   try { return new Date(ts).toLocaleDateString(ar ? "ar" : "en", { year: "numeric", month: "short", day: "numeric" }); }
   catch (_) { return ""; }
 }
+// Date AND time (the user wants the publish moment shown on every update).
+function annDateTime(ts, ar) {
+  try {
+    const d = new Date(ts);
+    const loc = ar ? "ar" : "en";
+    return d.toLocaleDateString(loc, { year: "numeric", month: "short", day: "numeric" }) + " · " +
+           d.toLocaleTimeString(loc, { hour: "2-digit", minute: "2-digit" });
+  } catch (_) { return ""; }
+}
+const annSafeId = (id) => String(id).replace(/[^A-Za-z0-9_-]/g, "");
+// Body-scroll lock so opening a panel/reader scrolls ITS content, not the whole page behind it.
+let _annScrollLock = 0;
+function lockBodyScroll() { if (_annScrollLock++ === 0) document.body.style.overflow = "hidden"; }
+function unlockBodyScroll() { if (_annScrollLock > 0 && --_annScrollLock === 0) document.body.style.overflow = ""; }
+const ANN_SVG_X = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+const ANN_SVG_EDIT = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
+const ANN_SVG_TRASH = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>';
 async function openAnnouncementsPanel() {
   const ar = state.lang === "ar";
   await fetchAnnouncements();
@@ -5842,7 +5859,8 @@ async function openAnnouncementsPanel() {
   const ov = document.createElement("div");
   ov.className = "mem-overlay ann-overlay";
   let onKey = null;
-  const close = () => { if (onKey) document.removeEventListener("keydown", onKey); ov.classList.remove("is-open"); setTimeout(() => ov.remove(), 200); };
+  const close = () => { if (onKey) document.removeEventListener("keydown", onKey); unlockBodyScroll(); ov.classList.remove("is-open"); setTimeout(() => ov.remove(), 200); };
+  const refresh = () => { close(); openAnnouncementsPanel(); };
 
   const adminForm = annIsAdmin ? (
     '<form class="ann-form">' +
@@ -5858,36 +5876,43 @@ async function openAnnouncementsPanel() {
   ) : "";
 
   const items = annCache.length ? annCache.map((a) =>
-    '<li class="ann-item" data-id="' + String(a.id).replace(/[^A-Za-z0-9_-]/g, "") + '">' +
-      (annIsAdmin ? '<button class="ann-del" aria-label="delete" title="' + (ar ? "حذف" : "delete") + '">×</button>' : '') +
-      (a.title ? '<h4 class="ann-item-title"></h4>' : '') +
-      (annImgOk(a.image) ? '<img class="ann-item-img" alt="">' : '') +
-      (a.body ? '<p class="ann-item-body"></p>' : '') +
-      '<time class="ann-item-date">' + annDate(a.ts, ar) + '</time>' +
+    '<li class="ann-item" data-id="' + annSafeId(a.id) + '" role="button" tabindex="0">' +
+      (annImgOk(a.image) ? '<img class="ann-item-thumb" alt="" loading="lazy">' : '') +
+      '<div class="ann-item-main">' +
+        '<h4 class="ann-item-title"></h4>' +
+        '<p class="ann-item-body"></p>' +
+        '<time class="ann-item-date"></time>' +
+      '</div>' +
+      '<span class="ann-item-go" aria-hidden="true"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></span>' +
     '</li>'
   ).join("") : '<li class="mem-empty">' + (ar ? "لا توجد تحديثات بعد." : "No updates yet.") + '</li>';
 
   ov.innerHTML =
     '<div class="mem-card ann-card" role="dialog" aria-modal="true">' +
       '<div class="mem-head"><div style="flex:1">' +
-        '<h3>' + (ar ? "تحديثات فِراس AI" : "Firas AI updates") + '</h3>' +
+        '<h3>' + (ar ? "تحديثات Firas AI" : "Firas AI updates") + '</h3>' +
         '<p>' + (ar ? "آخر أخبار وتحديثات المنصّة." : "Latest platform news & updates.") + '</p></div>' +
-        '<button class="mem-x" aria-label="' + (ar ? "إغلاق" : "close") + '"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>' +
+        '<button class="mem-x" aria-label="' + (ar ? "إغلاق" : "close") + '">' + ANN_SVG_X + '</button>' +
       '</div>' +
       adminForm +
       '<ul class="mem-list ann-list">' + items + '</ul>' +
     '</div>';
 
-  // XSS-safe: inject text + validated image src via the DOM, not the HTML string.
+  // XSS-safe: inject text + validated image src via the DOM, and wire each row to open the reader.
   ov.querySelectorAll(".ann-item").forEach((li) => {
-    const a = annCache.find((x) => String(x.id).replace(/[^A-Za-z0-9_-]/g, "") === li.getAttribute("data-id"));
+    const a = annCache.find((x) => annSafeId(x.id) === li.getAttribute("data-id"));
     if (!a) return;
-    const tEl = li.querySelector(".ann-item-title"); if (tEl) tEl.textContent = a.title || "";
+    const tEl = li.querySelector(".ann-item-title"); if (tEl) tEl.textContent = a.title || (ar ? "تحديث" : "Update");
     const bEl = li.querySelector(".ann-item-body"); if (bEl) bEl.textContent = a.body || "";
-    const iEl = li.querySelector(".ann-item-img"); if (iEl && annImgOk(a.image)) iEl.src = a.image;
+    const dEl = li.querySelector(".ann-item-date"); if (dEl) dEl.textContent = annDateTime(a.ts, ar);
+    const iEl = li.querySelector(".ann-item-thumb"); if (iEl && annImgOk(a.image)) iEl.src = a.image;
+    const open = () => openAnnouncementReader(a, refresh);
+    li.addEventListener("click", open);
+    li.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
   });
 
   document.body.appendChild(ov);
+  lockBodyScroll();
   setTimeout(() => ov.classList.add("is-open"), 20);
   ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
   ov.querySelector(".mem-x").addEventListener("click", close);
@@ -5914,17 +5939,148 @@ async function openAnnouncementsPanel() {
       try {
         await apiJson("/api/announcements", { method: "POST", body: JSON.stringify({ title, body: bodyTxt, image: pendingImg }) });
         showToast(ar ? "تم النشر ✓" : "Published ✓");
-        close(); openAnnouncementsPanel();
+        refresh();
       } catch (_) { showToast(ar ? "فشل النشر" : "Publish failed"); if (btn) { btn.disabled = false; btn.textContent = ar ? "نشر" : "Publish"; } }
     });
-    ov.querySelectorAll(".ann-del").forEach((b) => b.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const id = b.closest(".ann-item").getAttribute("data-id");
-      if (!window.confirm(ar ? "حذف هذا التحديث؟" : "Delete this update?")) return;
-      try { await apiJson("/api/announcements?id=" + encodeURIComponent(id), { method: "DELETE" }); } catch (_) {}
-      close(); openAnnouncementsPanel();
-    }));
   }
+}
+
+/* A single update opened FULL-SCREEN: image (tap to zoom), full text (own scroll),
+   an AR/EN AI-translation toggle, and admin edit/delete. */
+function openAnnouncementReader(a, onChange) {
+  const ar = state.lang === "ar";
+  const ov = document.createElement("div");
+  ov.className = "mem-overlay ann-reader-overlay";
+  let onKey = null;
+  const close = () => { if (onKey) document.removeEventListener("keydown", onKey); unlockBodyScroll(); ov.classList.remove("is-open"); setTimeout(() => ov.remove(), 200); };
+  a._tr = a._tr || {};
+  let curLang = null;
+
+  ov.innerHTML =
+    '<div class="ann-reader" role="dialog" aria-modal="true">' +
+      '<div class="ann-reader-bar">' +
+        '<div class="ann-langs">' +
+          '<button class="ann-lang is-on" data-l="orig">' + (ar ? "الأصل" : "Original") + '</button>' +
+          '<button class="ann-lang" data-l="ar">عربي</button>' +
+          '<button class="ann-lang" data-l="en">EN</button>' +
+        '</div>' +
+        '<div class="ann-reader-actions">' +
+          (annIsAdmin ? '<button class="ann-icon-btn ann-reader-edit" aria-label="' + (ar ? "تعديل" : "Edit") + '" title="' + (ar ? "تعديل" : "Edit") + '">' + ANN_SVG_EDIT + '</button>' +
+                        '<button class="ann-icon-btn ann-reader-del" aria-label="' + (ar ? "حذف" : "Delete") + '" title="' + (ar ? "حذف" : "Delete") + '">' + ANN_SVG_TRASH + '</button>' : '') +
+          '<button class="ann-icon-btn ann-reader-x" aria-label="' + (ar ? "إغلاق" : "close") + '">' + ANN_SVG_X + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="ann-reader-body">' +
+        (annImgOk(a.image) ? '<img class="ann-reader-img" alt="">' : '') +
+        '<h2 class="ann-reader-title"></h2>' +
+        '<time class="ann-reader-date"></time>' +
+        '<div class="ann-reader-text" dir="auto"></div>' +
+      '</div>' +
+    '</div>';
+
+  const titleEl = ov.querySelector(".ann-reader-title");
+  const textEl = ov.querySelector(".ann-reader-text");
+  const imgEl = ov.querySelector(".ann-reader-img");
+  ov.querySelector(".ann-reader-date").textContent = annDateTime(a.ts, ar) + (a.editedTs ? (ar ? " · مُعدّل" : " · edited") : "");
+  if (imgEl && annImgOk(a.image)) { imgEl.src = a.image; imgEl.style.cursor = "zoom-in"; imgEl.addEventListener("click", () => openImageLightbox(a.image)); }
+
+  const render = (lang) => {
+    const src = (lang && a._tr[lang]) ? a._tr[lang] : a;
+    titleEl.textContent = src.title || (ar ? "تحديث" : "Update");
+    titleEl.hidden = !src.title;
+    textEl.textContent = src.body || "";
+  };
+  render(null);
+
+  const langBtns = [...ov.querySelectorAll(".ann-lang")];
+  const setActive = (l) => langBtns.forEach((b) => b.classList.toggle("is-on", b.dataset.l === l));
+  langBtns.forEach((b) => b.addEventListener("click", async () => {
+    const l = b.dataset.l;
+    if (l === "orig") { curLang = null; setActive("orig"); render(null); return; }
+    setActive(l); curLang = l;
+    if (a._tr[l]) { render(l); return; }
+    const old = b.textContent; b.disabled = true; b.textContent = "…";
+    try {
+      const d = await apiJson("/api/translate", { method: "POST", body: JSON.stringify({ title: a.title || "", body: a.body || "", to: l }) });
+      a._tr[l] = { title: d.title || a.title || "", body: d.body || a.body || "" };
+      if (curLang === l) render(l);
+    } catch (_) { showToast(ar ? "تعذّرت الترجمة" : "Translation failed"); setActive(curLang === l ? l : "orig"); }
+    finally { b.disabled = false; b.textContent = old; }
+  }));
+
+  document.body.appendChild(ov);
+  lockBodyScroll();
+  setTimeout(() => ov.classList.add("is-open"), 20);
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  ov.querySelector(".ann-reader-x").addEventListener("click", close);
+  onKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+
+  if (annIsAdmin) {
+    const delBtn = ov.querySelector(".ann-reader-del");
+    if (delBtn) delBtn.addEventListener("click", async () => {
+      if (!window.confirm(ar ? "حذف هذا التحديث؟" : "Delete this update?")) return;
+      try { await apiJson("/api/announcements?id=" + encodeURIComponent(annSafeId(a.id)), { method: "DELETE" }); showToast(ar ? "تم الحذف" : "Deleted"); close(); onChange && onChange(); }
+      catch (_) { showToast(ar ? "فشل الحذف" : "Delete failed"); }
+    });
+    const editBtn = ov.querySelector(".ann-reader-edit");
+    if (editBtn) editBtn.addEventListener("click", () => openAnnouncementEditor(a, () => { close(); onChange && onChange(); }));
+  }
+}
+
+/* Admin: edit an update's text, replace/remove its image. */
+function openAnnouncementEditor(a, onDone) {
+  const ar = state.lang === "ar";
+  const ov = document.createElement("div");
+  ov.className = "mem-overlay ann-edit-overlay";
+  let onKey = null;
+  const close = () => { if (onKey) document.removeEventListener("keydown", onKey); unlockBodyScroll(); ov.classList.remove("is-open"); setTimeout(() => ov.remove(), 200); };
+  ov.innerHTML =
+    '<div class="mem-card ann-edit-card" role="dialog" aria-modal="true">' +
+      '<div class="mem-head"><div style="flex:1"><h3>' + (ar ? "تعديل التحديث" : "Edit update") + '</h3></div>' +
+        '<button class="mem-x" aria-label="' + (ar ? "إغلاق" : "close") + '">' + ANN_SVG_X + '</button></div>' +
+      '<form class="ann-form ann-edit-form">' +
+        '<input class="ann-in ann-title" type="text" maxlength="200" placeholder="' + (ar ? "عنوان التحديث" : "Update title") + '">' +
+        '<textarea class="ann-in ann-body" rows="5" maxlength="4000" placeholder="' + (ar ? "نص التحديث…" : "What’s new…") + '"></textarea>' +
+        '<div class="ann-form-row">' +
+          '<label class="ann-img-btn">' + (ar ? "تغيير الصورة" : "Replace image") + '<input type="file" accept="image/*" class="ann-file" hidden></label>' +
+          '<button type="button" class="ann-img-remove"' + (annImgOk(a.image) ? '' : ' hidden') + '>' + (ar ? "حذف الصورة" : "Remove image") + '</button>' +
+          '<button type="submit" class="ann-post">' + (ar ? "حفظ" : "Save") + '</button>' +
+        '</div>' +
+        '<img class="ann-img-preview"' + (annImgOk(a.image) ? '' : ' hidden') + ' alt="">' +
+      '</form>' +
+    '</div>';
+  ov.querySelector(".ann-title").value = a.title || "";
+  ov.querySelector(".ann-body").value = a.body || "";
+  const preview = ov.querySelector(".ann-img-preview");
+  if (annImgOk(a.image)) preview.src = a.image;
+  let newImage; // undefined = unchanged · "" = remove · dataURL = replace
+
+  ov.querySelector(".ann-file").addEventListener("change", async (e) => {
+    const f = e.target.files && e.target.files[0]; if (!f) return;
+    try { newImage = await fileToSmallDataURL(f, 1280, 0.82); preview.src = newImage; preview.hidden = false; ov.querySelector(".ann-img-remove").hidden = false; }
+    catch (_) { showToast(ar ? "تعذّر تحميل الصورة" : "Couldn't load image"); }
+  });
+  ov.querySelector(".ann-img-remove").addEventListener("click", () => { newImage = ""; preview.hidden = true; ov.querySelector(".ann-img-remove").hidden = true; });
+
+  ov.querySelector(".ann-edit-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const title = ov.querySelector(".ann-title").value.trim();
+    const body = ov.querySelector(".ann-body").value.trim();
+    const btn = ov.querySelector(".ann-post"); btn.disabled = true; const lbl = btn.textContent; btn.textContent = ar ? "يُحفظ…" : "Saving…";
+    const payload = { id: annSafeId(a.id), title, body };
+    if (newImage !== undefined) payload.image = newImage;
+    try { await apiJson("/api/announcements", { method: "PATCH", body: JSON.stringify(payload) }); showToast(ar ? "تم الحفظ ✓" : "Saved ✓"); close(); onDone && onDone(); }
+    catch (_) { showToast(ar ? "فشل الحفظ" : "Save failed"); btn.disabled = false; btn.textContent = lbl; }
+  });
+
+  document.body.appendChild(ov);
+  lockBodyScroll();
+  setTimeout(() => ov.classList.add("is-open"), 20);
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  ov.querySelector(".mem-x").addEventListener("click", close);
+  onKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
 }
 
 /* ----------------------------------------------------------------------------
