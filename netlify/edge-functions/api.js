@@ -117,7 +117,7 @@ const TIERS = {
   // Env-overridable so the model can be swapped without a redeploy if Ollama's
   // cloud catalog rotates. fallbackModel degrades to a known-good hosted model
   // (gpt-oss) before the last-resort pollinations fallback.
-  max:   { model: env("OLLAMA_MODEL_MAX") || "qwen3.5:397b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: false },
+  max:   { model: env("OLLAMA_MODEL_MAX") || "qwen3-coder:480b-cloud", temperature: 0.7, num_predict: 32768, fallbackModel: env("OLLAMA_MODEL_MAX_FALLBACK") || "gpt-oss:120b-cloud", capped: false },
 };
 // Vision model. The edge ALWAYS talks to Ollama cloud, which does NOT host the
 // local-only qwen2.5vl — so use a CLOUD-hosted multimodal model. gemma3:27b-cloud
