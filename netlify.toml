@@ -31,3 +31,22 @@
 # Static files serve automatically for every non-/api path — all routes are real
 # files (/, /index.html, /app.js, /styles.css, /firebase-config.js). The edge
 # function intercepts every /api/* request and returns 404 for unknown api paths.
+
+# ── Caching ──────────────────────────────────────────────────────────────────
+# HTML always revalidates; JS/CSS serve instantly from browser cache for 5 min
+# and refresh in the background (stale-while-revalidate) — repeat visits boot
+# with zero asset round-trips, and a deploy fully propagates within minutes.
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "public, max-age=300, stale-while-revalidate=86400"
+
+[[headers]]
+  for = "/*.css"
+  [headers.values]
+    Cache-Control = "public, max-age=300, stale-while-revalidate=86400"

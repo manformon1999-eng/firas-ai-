@@ -72,7 +72,7 @@ const OLLAMA_MODEL_VISION = process.env.OLLAMA_MODEL_VISION || 'qwen2.5vl:7b';
 
 // Image caps: at most 6 images per request; skip any single image whose raw
 // base64 exceeds ~8MB.
-const MAX_IMAGES_PER_REQUEST = 6;
+const MAX_IMAGES_PER_REQUEST = 10;
 const MAX_IMAGE_B64_BYTES = 8_000_000;
 
 // Strip an optional "data:image/...;base64," prefix and return RAW base64.

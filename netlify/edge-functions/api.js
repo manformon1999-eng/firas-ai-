@@ -122,20 +122,37 @@ function kbChunk(text) {
 function kbSearchChunks(books, query, maxChunks) {
   const qt = kbTokens(query); if (!qt.length) return [];
   const qset = new Set(qt); const scored = [];
-  for (const book of books) for (const c of (book.chunks || [])) {
-    const ct = kbTokens(c); if (!ct.length) continue;
-    let hits = 0; for (const t of ct) if (qset.has(t)) hits++;
-    if (!hits) continue;
-    const cov = (new Set(ct.filter((t) => qset.has(t)))).size / qset.size;
-    scored.push({ score: cov * 2 + hits / Math.sqrt(ct.length + 5), text: c });
+  for (const book of books) {
+    const chunks = book.chunks || [];
+    const toks = book._toks || chunks.map((c) => kbTokens(c));   // prefer pre-tokenized (isolate cache)
+    for (let i = 0; i < chunks.length; i++) {
+      const ct = toks[i]; if (!ct || !ct.length) continue;
+      let hits = 0; for (const t of ct) if (qset.has(t)) hits++;
+      if (!hits) continue;
+      const cov = (new Set(ct.filter((t) => qset.has(t)))).size / qset.size;
+      scored.push({ score: cov * 2 + hits / Math.sqrt(ct.length + 5), text: chunks[i] });
+    }
   }
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, maxChunks || 4).filter((h) => h.score > 0.25);
 }
+// Isolate-level KB cache: without it EVERY chat message re-downloads the WHOLE library from
+// Firebase and re-tokenizes every chunk — with any-size books that ruins latency. 60s TTL,
+// pre-tokenized once per fetch; busted by the /api/kb POST/DELETE handlers.
+let _kbCache = { at: 0, books: null };
+function kbCacheBust() { _kbCache = { at: 0, books: null }; }
 async function kbContext(query) {
-  let node; try { node = await dbGet("kb"); } catch (_) { return ""; }
-  if (!node) return "";
-  const hits = kbSearchChunks(Object.values(node), query, 4);
+  let books;
+  if (_kbCache.books && Date.now() - _kbCache.at < 60_000) books = _kbCache.books;
+  else {
+    let node; try { node = await dbGet("kb"); } catch (_) { return ""; }
+    if (!node) { _kbCache = { at: Date.now(), books: [] }; return ""; }
+    books = Object.values(node);
+    for (const b of books) b._toks = (b.chunks || []).map((c) => kbTokens(c));
+    _kbCache = { at: Date.now(), books };
+  }
+  if (!books.length) return "";
+  const hits = kbSearchChunks(books, query, 4);
   if (!hits.length) return "";
   return "REFERENCE MATERIAL (authoritative — use it to answer accurately and completely, then organize " +
     "clearly. NEVER mention, quote, cite, or hint that this material or a book exists — answer as your own knowledge):\n" +
@@ -144,9 +161,11 @@ async function kbContext(query) {
 const ANN_IMG_OK = (s) => typeof s === "string" && /^(data:image\/(png|jpe?g|webp);base64,|https?:\/\/)/.test(s);
 
 const TIERS = {
-  mini:  { model: env("OLLAMA_MODEL_MINI")  || "gpt-oss:120b-cloud",     temperature: 0.5, num_predict: 16384 },
-  pro:   { model: env("OLLAMA_MODEL_PRO")   || "gpt-oss:120b-cloud",     temperature: 0.7, num_predict: 131072 },
-  ultra: { model: env("OLLAMA_MODEL_ULTRA") || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536 },
+  // EVERY tier has a fallbackModel on a DIFFERENT hosted pool, so a busy/saturated primary degrades
+  // to a working model instead of surfacing "The Firas AI engine is busy".
+  mini:  { model: env("OLLAMA_MODEL_MINI")  || "gpt-oss:120b-cloud",     temperature: 0.5, num_predict: 16384,  fallbackModel: "qwen3-coder:480b-cloud" },
+  pro:   { model: env("OLLAMA_MODEL_PRO")   || "gpt-oss:120b-cloud",     temperature: 0.7, num_predict: 131072, fallbackModel: "qwen3-coder:480b-cloud" },
+  ultra: { model: env("OLLAMA_MODEL_ULTRA") || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536,  fallbackModel: "gpt-oss:120b-cloud" },
   // Max = strongest general/reasoning model (671B), gated by a per-user daily cap.
   // Env-overridable so the model can be swapped without a redeploy if Ollama's
   // cloud catalog rotates. fallbackModel degrades to a known-good hosted model
@@ -157,7 +176,7 @@ const TIERS = {
 // local-only qwen2.5vl — so use a CLOUD-hosted multimodal model. gemma3:27b-cloud
 // is free, available, and reads images (verified). Env-overridable.
 const OLLAMA_MODEL_VISION = env("OLLAMA_MODEL_VISION") || "gemma3:27b-cloud";
-const MAX_IMAGES_PER_REQUEST = 6;
+const MAX_IMAGES_PER_REQUEST = 10;
 const MAX_IMAGE_B64_BYTES = 8000000;
 const SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -620,11 +639,14 @@ function chatStreamResponse(messages, tier, think, vision) {
         if (!okOllama && !closed) {
           if (vision) { enc(sseFrame("The Firas AI vision engine is offline right now, so I can't view images. Please try again shortly.")); }
           else {
-            // For a capped tier (Max), first degrade to its known-good Ollama
-            // fallback model (gpt-oss) before the last-resort pollinations path.
+            // RESCUE CHAIN for EVERY tier — never surface "busy" while any engine can answer:
+            // 1) the tier's Ollama fallback model (different hosted pool), 2) Gemini Flash (free),
+            // 3) OpenRouter free, 4) last-resort pollinations text fallback.
             const fb = TIERS[tier] && TIERS[tier].fallbackModel;
             let recovered = false;
             if (fb) recovered = await streamOllamaInto(enc, ollamaMessages, tier, think, ac.signal, fb);
+            if (!recovered && !closed) recovered = await streamGeminiInto(enc, messages, ac.signal);
+            if (!recovered && !closed) recovered = await streamOpenRouterInto(enc, messages, ac.signal);
             if (!recovered && !closed) await streamFallbackInto(enc, stripImages(messages), tier, think, ac.signal);
           }
         }
@@ -645,13 +667,16 @@ async function streamOllamaInto(enc, messages, tier, think, signal, modelOverrid
   const headers = { "content-type": "application/json" };
   if (OLLAMA_API_KEY) headers["Authorization"] = "Bearer " + OLLAMA_API_KEY;
   let upstream = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // 3 attempts with REAL backoff — a transient 429/503 (Ollama cloud briefly saturated) usually
+  // clears within a second or two; 2 tries 400ms apart were far too impatient and surfaced "busy".
+  const BACKOFF = [600, 1800];
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       upstream = await fetch(OLLAMA_CHAT_URL, { method: "POST", headers, body: reqBody, signal });
       if (upstream.ok && upstream.body) break;
       upstream = null;
     } catch (e) { if (signal.aborted) return true; upstream = null; }
-    if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+    if (attempt < 2) await new Promise((r) => setTimeout(r, BACKOFF[attempt]));
   }
   if (!upstream) return false; // unreachable -> caller falls back
   const reader = upstream.body.getReader(); let buffer = "";
@@ -1375,7 +1400,7 @@ export default async (request, context) => {
       if (!user) return json({ error: "not authenticated" }, 401);
       if (method === "GET") {
         const meta = (await dbGet("chatMeta/" + user.id)) || {};
-        const list = Object.keys(meta).map((id) => ({ id, title: meta[id].title, updatedAt: meta[id].updatedAt, pinned: !!meta[id].pinned })).sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+        const list = Object.keys(meta).map((id) => ({ id, title: meta[id].title, updatedAt: meta[id].updatedAt, pinned: !!meta[id].pinned, agent: !!meta[id].agent })).sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
         return json(list);
       }
       if (method === "POST") {
@@ -1383,9 +1408,9 @@ export default async (request, context) => {
         const meta = (await dbGet("chatMeta/" + user.id)) || {};
         if (Object.keys(meta).length >= MAX_CHATS_PER_USER) return json({ error: "chat limit reached; delete some conversations" }, 409);
         const now = new Date().toISOString();
-        const chat = { id: crypto.randomUUID(), userId: user.id, title: String(b.title ?? "New chat").slice(0, 200) || "New chat", messages: sanitizeMessages(b.messages), pinned: !!b.pinned, createdAt: now, updatedAt: now };
+        const chat = { id: crypto.randomUUID(), userId: user.id, title: String(b.title ?? "New chat").slice(0, 200) || "New chat", messages: sanitizeMessages(b.messages), pinned: !!b.pinned, agent: !!b.agent, createdAt: now, updatedAt: now };
         await dbPut(`chats/${user.id}/${chat.id}`, chat);
-        await dbPut(`chatMeta/${user.id}/${chat.id}`, { title: chat.title, updatedAt: now, pinned: chat.pinned });
+        await dbPut(`chatMeta/${user.id}/${chat.id}`, { title: chat.title, updatedAt: now, pinned: chat.pinned, agent: chat.agent });
         return json({ id: chat.id, title: chat.title, createdAt: now, updatedAt: now }, 201);
       }
       return new Response("method not allowed", { status: 405 });
@@ -1410,7 +1435,7 @@ export default async (request, context) => {
         if (typeof b.pinned === "boolean") chat.pinned = b.pinned; // pin toggle alone must not bump updatedAt
         if (touched) chat.updatedAt = new Date().toISOString();
         await dbPut(`chats/${user.id}/${id}`, chat);
-        await dbPut(`chatMeta/${user.id}/${id}`, { title: chat.title, updatedAt: chat.updatedAt, pinned: !!chat.pinned });
+        await dbPut(`chatMeta/${user.id}/${id}`, { title: chat.title, updatedAt: chat.updatedAt, pinned: !!chat.pinned, agent: !!chat.agent });
         return json({ ok: true });
       }
       if (method === "DELETE") {
@@ -1534,6 +1559,7 @@ export default async (request, context) => {
       const id = "kb" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       const book = { id, title, chunks, ts: Date.now() };
       try { await dbPut("kb/" + id, book); } catch (_) {}
+      kbCacheBust();
       return json({ ok: true, id, title, chunks: chunks.length });
     }
     if (path === "/api/kb" && method === "DELETE") {
@@ -1541,7 +1567,43 @@ export default async (request, context) => {
       if (!user) return json({ error: "authentication required" }, 401);
       if (!isAdmin(user)) return json({ error: "admins only" }, 403);
       const id = url.searchParams.get("id");
-      if (id) { try { await dbPut("kb/" + id, null); } catch (_) {} }
+      if (id) { try { await dbPut("kb/" + id, null); } catch (_) {} kbCacheBust(); }
+      return json({ ok: true });
+    }
+    // ── Public share links: snapshot a chat → read-only page at /?share=<id> ──
+    if (path === "/api/share" && method === "POST") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "authentication required" }, 401);
+      let b; try { b = await request.json(); } catch { return json({ error: "invalid JSON" }, 400); }
+      const chat = await dbGet(`chats/${user.id}/${String(b.chatId || "")}`);
+      if (!chat) return json({ error: "not found" }, 404);
+      const id = "s" + Date.now().toString(36) + crypto.randomUUID().replace(/-/g, "").slice(0, 10);
+      // Snapshot only what the public page needs — content/lang/tier/thumbs; never raw images,
+      // never fileText, never user identity.
+      const msgs = (chat.messages || []).slice(0, 400).map((m) => {
+        const o = { role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "").slice(0, 200000) };
+        if (m.lang) o.lang = String(m.lang).slice(0, 8);
+        if (m.tier) o.tier = String(m.tier).slice(0, 16);
+        if (Array.isArray(m.imageThumbs) && m.imageThumbs.length) o.imageThumbs = m.imageThumbs.slice(0, 10).map((s) => String(s).slice(0, 200000));
+        return o;
+      });
+      await dbPut("shares/" + id, { id, title: String(chat.title || "").slice(0, 200), messages: msgs, ts: Date.now(), owner: user.id });
+      return json({ ok: true, id });
+    }
+    if (path === "/api/share" && method === "GET") {   // PUBLIC — no auth: this is the whole point
+      const id = String(url.searchParams.get("id") || "").replace(/[^a-zA-Z0-9]/g, "");
+      if (!id) return json({ error: "missing id" }, 400);
+      const snap = await dbGet("shares/" + id);
+      if (!snap) return json({ error: "not found" }, 404);
+      return json({ id: snap.id, title: snap.title || "", messages: snap.messages || [], ts: snap.ts || 0 });
+    }
+    if (path === "/api/share" && method === "DELETE") {
+      const user = await currentUser(context);
+      if (!user) return json({ error: "authentication required" }, 401);
+      const id = String(url.searchParams.get("id") || "").replace(/[^a-zA-Z0-9]/g, "");
+      const snap = id ? await dbGet("shares/" + id) : null;
+      if (snap && snap.owner !== user.id && !isAdmin(user)) return json({ error: "not yours" }, 403);
+      if (snap) { try { await dbPut("shares/" + id, null); } catch (_) {} }
       return json({ ok: true });
     }
     if (path === "/api/translate" && method === "POST") {

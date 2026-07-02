@@ -43,7 +43,7 @@ const MODELS = {
     short: { ar: "برو", en: "Pro" },
     reasoning_effort: "low",
     temperature: 0.6,
-    max_tokens: 5000,
+    max_tokens: 16384,   // the no-backend fallback transport must never strangle a long document
     showThinking: true,
     persona:
       "You are Firas Pro, a top-tier expert assistant. Be helpful, well-structured and " +
@@ -522,10 +522,12 @@ const LS_THINK = "firas_ai_think";
 const LS_MODE = "firas_ai_mode";
 const LS_SIDEBAR = "firas_ai_sidebar_collapsed";
 const LS_WEBSEARCH = "firas_ai_websearch";
+const LS_PRODUCT = "firas_ai_product";
 
 const state = {
   chats: [],          // sidebar list: [{ id, title, updatedAt, messages? }] — messages loaded on open
   activeId: null,
+  product: "ai",      // "ai" (chat) | "agent" (Firas Agent — its OWN chats & environment)
   tier: CONFIG.DEFAULT_TIER,
   mode: "auto",       // response mode: "auto" | "plan" (separate from tier)
   theme: "dark",      // DARK is the default theme (overridable via the toggle)
@@ -648,10 +650,16 @@ function codeSpecFromText(text) {
 
 /** Return a code spec ({lang,ext,label,filename}) when the user wants source code,
     else null. Questions ("ما هو html؟") never match — they lack a build verb. */
+// A request to DRAW/sketch a STATIC figure or graph (ارسم / رسم دالة / draw…) is a TikZ
+// figure shown in chat — NOT a code/website build — unless explicit web-app words appear.
+const DRAW_REQUEST = /\b(draw|sketch)\b|ارسم|إرسم|ارسملي|ارسم\s*لي|رسم\s*بياني|رسم\s*دالة|رسم\s*شكل|رسم\s*مثلث|رسم\s*دائرة|رسمة|رسمه|مخطّط|مخطط/i;
+const DRAW_AS_APP = /website|web\s*app|web\s*page|\bpage\b|\bsite\b|interactive|canvas|\bhtml\b|\bcss\b|javascript|\bjs\b|\bgame\b|موقع|صفحة|تطبيق|تفاعل|لعبة/i;
 function detectCodeRequest(text) {
   if (!text) return null;
   const s = String(text);
   if (CODE_DOC_OVERRIDE.test(s)) return null; // explicit doc format → not code
+  // A drawing/figure/graph request → a TikZ figure in chat, NOT code — bail before code routing.
+  if (DRAW_REQUEST.test(s) && !DRAW_AS_APP.test(s) && !CODE_SPEC.test(s)) return null;
   if (CODE_SPEC.test(s)) return codeSpecFromText(s);
   const hasVerb = CODE_BUILD_VERBS.test(s);
   if (!hasVerb) return null;
@@ -831,6 +839,7 @@ function loadState() {
   const savedThink = localStorage.getItem(LS_THINK);
   state.think = savedThink === null ? true : savedThink === "true";
   state.webSearch = localStorage.getItem(LS_WEBSEARCH) === "true";
+  state.product = localStorage.getItem(LS_PRODUCT) === "agent" ? "agent" : "ai";
   const savedLang = localStorage.getItem(LS_LANG);
   if (savedLang) state.lang = savedLang;
   else state.lang = (navigator.language || "ar").startsWith("en") ? "en" : "ar";
@@ -927,7 +936,7 @@ async function persistChat(chat) {
   // otherwise a concurrent finalize would fire a SECOND POST and duplicate the
   // conversation in history (the create is the only place serverId gets set).
   if (!chat.serverId && chat._creating) { try { await chat._creating; } catch (_) {} }
-  const payload = { title: chat.title, messages: serializeMessages(chat.messages), pinned: !!chat.pinned };
+  const payload = { title: chat.title, messages: serializeMessages(chat.messages), pinned: !!chat.pinned, agent: !!chat.agent };
   try {
     if (chat.serverId) {
       await apiJson("/api/chats/" + encodeURIComponent(chat.serverId), {
@@ -1091,6 +1100,9 @@ function buildFileDisclosure(content) {
 function detectImageRequest(text) {
   const s = String(text || "");
   if (!s.trim()) return false;
+  // A MATH function graph / equation / geometric figure ("ارسم y = …", رسم بياني, دالة, مثلث،
+  // sin(x)…) is a chat plot/tikz — NOT an AI image. Never route those to the image generator.
+  if (/y\s*=|f\s*\(\s*x\s*\)|رسم\s*بياني|الكراف|الغراف|\bgraph\b|\bplot\b|دال[ةه]|منحن[يى]|\bfunction\b|معادلة|\b(?:sin|cos|tan|cot|sec|csc|exp|log|ln|lg|sqrt|cbrt|arctan|arcsin|arccos|sinh|cosh|tanh)\s*\(|مثلث|\bمربع\b|مستطيل|\bدائرة\b|قطع\s*مكافئ|\bparabola\b|متجه|\bvector\b|إحداثي|احداثي/i.test(s)) return false;
   if (/[?؟]\s*$/.test(s) && !/(اصنع|ارسم|ولّد|ولد|generate|draw|create|make)/i.test(s)) return false;
   const ar = /(اصنع|اعمل|سوّ?ي?(?:لي)?|ارسم|إرسم|ولّ?د|صم[مّ]|اعطني|اعطيني|عطني|اريد|بدي)\s*[^؟?]{0,24}?(صورة|صوره|رسمة|رسمه|لوحة|بوستر|تصميم|خلفية|لوغو|شعار|بورتريه)/i;
   const arDraw = /(^|\s)(ارسم|إرسم)(\s|$)/i;
@@ -1463,10 +1475,25 @@ function renderLiveCodeInto(mdEl, raw, spec, lang) {
   if (body) body.scrollTop = body.scrollHeight; // follow the newest line
 }
 
+/* Normalize an UNFENCED \begin{tikzpicture}…\end{tikzpicture} (some models emit the
+   drawing without a ```tikz fence) into a proper ```tikz code block, so it still renders
+   as a figure instead of leaking raw LaTeX. Tikz already inside a ``` fence is left alone. */
+function normalizeTikz(text) {
+  if (!text || String(text).indexOf("tikzpicture") === -1) return text;
+  const fences = [];
+  let t = String(text).replace(/```[\s\S]*?```/g, (m) => { fences.push(m); return " F" + (fences.length - 1) + " "; });
+  t = t.replace(/\\begin\s*\{tikzpicture\}[\s\S]*?\\end\s*\{tikzpicture\}/g, (m) => "\n\n```tikz\n" + m + "\n```\n\n");
+  t = t.replace(/ F(\d+) /g, (_, i) => fences[+i]);
+  return t;
+}
+
 function renderMarkdown(text, opts) {
   text = stripFileMetaBlock(text); // never render the AI's file-metadata block
   text = stripImageMetaBlock(text); // nor the image-generation block
   text = stripCodeMetaBlock(text); // nor the code-deliverable block
+  text = normalizeTikz(text); // unfenced \begin{tikzpicture} → ```tikz so it renders as a figure
+  if (typeof fixMathBlanks === "function") text = fixMathBlanks(text); // \color{red}{\text{___}} → valid \underline blank (KaTeX-safe)
+  if (typeof sanitizeBareLatex === "function") text = sanitizeBareLatex(text); // bare \underline / \cdotp outside math → wrapped/unicode (no raw backslashes)
   const hasMarked = typeof window.marked !== "undefined";
   const hasPurify = typeof window.DOMPurify !== "undefined";
 
@@ -1565,6 +1592,8 @@ function decorateMarkdown(container) {
   container.querySelectorAll("pre > code").forEach((code) => {
     const pre = code.parentElement;
     if (pre.closest(".code-block")) return;
+    if (plotifyCodeBlock(code)) return;   // ```plot → instant SVG function graph (no engine)
+    if (tikzifyCodeBlock(code)) return;   // ```tikz → rendered figure (not a code box)
 
     const langMatch = (code.className || "").match(/language-(\w+)/);
     const lang = langMatch ? langMatch[1] : "code";
@@ -1609,6 +1638,7 @@ function decorateMarkdown(container) {
   container.querySelectorAll("a[href^='http']").forEach((a) => {
     a.target = "_blank"; a.rel = "noopener noreferrer";
   });
+  scheduleTikz();   // render any ```tikz figures just inserted
 }
 
 /** Typeset LaTeX math in a rendered node via KaTeX auto-render. Never throws.
@@ -1628,6 +1658,650 @@ function typesetMath(node) {
       ignoredTags: ["script", "noscript", "style", "textarea", "pre", "code"],
     });
   } catch (_) { /* KaTeX unavailable or parse issue — leave text as-is */ }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   SKETCH FROM LaTeX — render ```tikz blocks into real figures via TikZJax.
+   TikZJax compiles TikZ → SVG fully in the browser (WASM). It scans for
+   <script type="text/tikz"> when it executes, so we (re)load it whenever new
+   pending figures appear. Degrades gracefully: if the engine can't load or a
+   picture fails, the original TikZ source falls back to a normal code box.
+   The rendered SVG lives in the DOM, so it carries into PDF export for free. */
+const TIKZJAX_JS = "https://tikzjax.com/v1/tikzjax.js";
+const TIKZJAX_CSS = "https://tikzjax.com/v1/fonts.css";
+let tikzLoadFailed = false;
+let tikzTimer = null;
+
+/* ══ Instant mini-TikZ → SVG ═══════════════════════════════════════════════════════════════
+   Interprets the common EXPLICIT-COORDINATE \draw/\fill/\node/\coordinate/\foreach subset the
+   model uses for physics/geometry figures and renders it straight to SVG — instant & reliable
+   (like ```plot), no heavy TeX engine. Returns an SVG string, or null on anything it can't
+   interpret (relative `right=of` positioning, node anchors like (n.east), arcs, plots…) so the
+   caller falls back to TikZJax. */
+let tikzSeq = 0;
+const TIKZ_COLOR = { black: "#111827", white: "#ffffff", red: "#dc2626", green: "#16a34a",
+  blue: "#2563eb", cyan: "#0891b2", magenta: "#c026d3", yellow: "#ca8a04", orange: "#ea7317",
+  purple: "#7c3aed", violet: "#7c3aed", brown: "#92400e", pink: "#db2777", teal: "#0d9488",
+  lime: "#65a30d", olive: "#6b7d1a", gray: "#6b7280", grey: "#6b7280", lightgray: "#d1d5db",
+  darkgray: "#374151", none: "none" };
+function tikzHx(h) { h = String(h).replace("#", ""); if (h.length === 3) h = h.split("").map((c) => c + c).join(""); return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]; }
+function tikzMix(a, b, t) { const A = tikzHx(a), B = tikzHx(b); return "#" + [0, 1, 2].map((i) => Math.round(A[i] * t + B[i] * (1 - t)).toString(16).padStart(2, "0")).join(""); }
+function tikzColor(spec) {
+  spec = String(spec).trim(); if (!spec) return null;
+  const p = spec.split("!");
+  let base = TIKZ_COLOR[p[0].toLowerCase()]; if (base === undefined) { if (/^[0-9a-fA-F]{6}$/.test(p[0])) base = "#" + p[0]; else return null; }
+  if (p.length >= 2 && /^\d+$/.test(p[1])) { const t = Math.max(0, Math.min(100, parseInt(p[1], 10))) / 100; const other = p[2] ? (TIKZ_COLOR[p[2].toLowerCase()] || "#ffffff") : "#ffffff"; return tikzMix(base === "none" ? "#ffffff" : base, other, t); }
+  return base;
+}
+const TIKZ_SUP = { "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴", "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹", "+": "⁺", "-": "⁻", "n": "ⁿ", "i": "ⁱ" };
+const TIKZ_SUB = { "0": "₀", "1": "₁", "2": "₂", "3": "₃", "4": "₄", "5": "₅", "6": "₆", "7": "₇", "8": "₈", "9": "₉", "+": "₊", "-": "₋", "a": "ₐ", "e": "ₑ", "x": "ₓ" };
+const TIKZ_GREEK = { alpha: "α", beta: "β", gamma: "γ", delta: "δ", epsilon: "ε", theta: "θ", lambda: "λ", mu: "µ", nu: "ν", pi: "π", rho: "ρ", sigma: "σ", tau: "τ", phi: "φ", psi: "ψ", omega: "ω", Gamma: "Γ", Delta: "Δ", Theta: "Θ", Lambda: "Λ", Sigma: "Σ", Phi: "Φ", Psi: "Ψ", Omega: "Ω", infty: "∞", cdot: "·", times: "×", pm: "±", to: "→", rightarrow: "→", leftarrow: "←", approx: "≈", neq: "≠", leq: "≤", geq: "≥", degree: "°", circ: "∘", prime: "′", ldots: "…" };
+function tikzUni(str, map) { return String(str).split("").map((c) => map[c] || c).join(""); }
+function tikzLabelText(lbl) {
+  let t = String(lbl);
+  t = t.replace(/\\displaystyle|\\limits|\\!|\\,|\\;|\\:|\\ /g, " ");
+  t = t.replace(/\\(?:mathbf|mathrm|text|textbf|textit|mathit|boldsymbol|vec|hat|bar|overrightarrow)\s*\{([^{}]*)\}/g, "$1");
+  t = t.replace(/\$/g, "");
+  t = t.replace(/\^\{([^{}]*)\}/g, (m, a) => tikzUni(a, TIKZ_SUP)).replace(/\^(\S)/g, (m, a) => tikzUni(a, TIKZ_SUP));
+  t = t.replace(/_\{([^{}]*)\}/g, (m, a) => tikzUni(a, TIKZ_SUB)).replace(/_(\S)/g, (m, a) => tikzUni(a, TIKZ_SUB));
+  t = t.replace(/\\([a-zA-Z]+)/g, (m, n) => (TIKZ_GREEK[n] !== undefined ? TIKZ_GREEK[n] : n));
+  return t.replace(/[{}]/g, "").replace(/\s+/g, " ").trim();
+}
+function tikzBalanced(s, i) { if (s[i] !== "{") return null; let d = 0, j = i; for (; j < s.length; j++) { if (s[j] === "{") d++; else if (s[j] === "}") { d--; if (d === 0) return { inner: s.slice(i + 1, j), end: j + 1 }; } } return null; }
+function tikzExpandList(str) {
+  const raw = str.split(",").map((s) => s.trim()).filter((s) => s !== "");
+  const di = raw.indexOf("...");
+  if (di <= 0 || di >= raw.length - 1) return raw;
+  const before = raw.slice(0, di), b = parseFloat(raw[di + 1]), a = parseFloat(before[before.length - 1]);
+  const step = before.length >= 2 ? (a - parseFloat(before[before.length - 2])) : (a <= b ? 1 : -1);
+  const list = before.slice();
+  if (step) for (let v = a + step; step > 0 ? v <= b + 1e-9 : v >= b - 1e-9; v += step) list.push(String(+v.toFixed(6)));
+  return list;
+}
+function tikzExpandForeach(body, depth) {
+  depth = depth || 0; if (depth > 8) return body;
+  const idx = body.search(/\\foreach\b/); if (idx < 0) return body;
+  const head = /\\foreach\s*\\(\w+)\s*(?:\[[^\]]*\])?\s*in\s*\{([^{}]*)\}\s*/.exec(body.slice(idx));
+  if (!head) return body;
+  let bstart = idx + head.index + head[0].length, loopBody, after;
+  if (body[bstart] === "{") { const bal = tikzBalanced(body, bstart); if (!bal) return body; loopBody = bal.inner; after = bal.end; }
+  else { const semi = body.indexOf(";", bstart); if (semi < 0) return body; loopBody = body.slice(bstart, semi + 1); after = semi + 1; }
+  const items = tikzExpandList(head[2]);
+  const expanded = items.map((v) => loopBody.replace(new RegExp("\\\\" + head[1] + "(?![a-zA-Z])", "g"), v)).join("\n");
+  return tikzExpandForeach(body.slice(0, idx) + expanded + body.slice(after), depth + 1);
+}
+function tikzSplitStatements(body) {
+  const out = []; let cur = "", d = 0;
+  for (let i = 0; i < body.length; i++) { const c = body[i]; if (c === "{" || c === "[" || c === "(") d++; else if (c === "}" || c === "]" || c === ")") d = Math.max(0, d - 1); if (c === ";" && d === 0) { out.push(cur); cur = ""; } else cur += c; }
+  if (cur.trim()) out.push(cur); return out;
+}
+function tikzCoord(inner, coords) {
+  inner = String(inner).trim(); if (coords[inner]) return coords[inner].slice();
+  const p = inner.split(",");
+  if (p.length >= 2) {
+    const ev = (t) => { t = String(t).trim(); if (/^-?[\d.]+$/.test(t)) return parseFloat(t); const fn = (typeof compilePlotExpr === "function") ? compilePlotExpr(t) : null; return fn ? fn(0) : parseFloat(t); };
+    const x = ev(p[0]), y = ev(p[1]);
+    if (isFinite(x) && isFinite(y)) return [x, y];
+  }
+  return null;
+}
+function tikzLen(s) { const m = String(s).match(/(-?[\d.]+)\s*(pt|cm|mm|em|ex)?/); if (!m) return null; let v = parseFloat(m[1]); const u = m[2] || "cm"; if (u === "pt") v /= 28.45; else if (u === "mm") v /= 10; else if (u === "em" || u === "ex") v *= 0.35; return v; }
+function tikzOptsStyle(opts, cmd) {
+  const o = String(opts || ""); const st = { stroke: "#111827", width: 1.2, fill: "none", dash: "", mS: false, mE: false };
+  if (cmd === "fill") { st.fill = "#111827"; st.stroke = "none"; }
+  if (/<->|<\s*->/.test(o)) { st.mS = true; st.mE = true; } else { if (/->/.test(o)) st.mE = true; if (/<-/.test(o)) st.mS = true; }
+  if (/ultra thick/.test(o)) st.width = 2.6; else if (/very thick/.test(o)) st.width = 2; else if (/\bthick\b/.test(o)) st.width = 1.7; else if (/very thin/.test(o)) st.width = 0.5; else if (/\bthin\b/.test(o)) st.width = 0.7;
+  const lw = o.match(/line width\s*=\s*([\d.]+)\s*pt/); if (lw) st.width = parseFloat(lw[1]) * 1.1;
+  if (/dashed/.test(o)) st.dash = "6,4"; else if (/dotted/.test(o)) st.dash = "1.5,3";
+  const fm = o.match(/fill\s*=\s*([a-zA-Z]+(?:!\d+(?:!\w+)?)?|[0-9a-fA-F]{6})/); if (fm) { const c = tikzColor(fm[1]); if (c) st.fill = c; }
+  const dm = o.match(/draw\s*=\s*([a-zA-Z]+(?:!\d+)?|[0-9a-fA-F]{6})/); if (dm) { const c = tikzColor(dm[1]); if (c) st.stroke = c; }
+  o.split(",").map((w) => w.trim()).forEach((w) => { if (w && !/=/.test(w) && TIKZ_COLOR[w.toLowerCase()] !== undefined) st.stroke = tikzColor(w); });
+  return st;
+}
+function tikzParseCoordinate(st, coords) { const m = st.match(/\\coordinate\s*(?:\[[^\]]*\])?\s*\(([^)]+)\)\s*at\s*\(([^)]+)\)/); if (!m) return false; const p = tikzCoord(m[2], coords); if (!p) return false; coords[m[1].trim()] = p; return true; }
+function tikzParsePath(st, coords, els, addPt) {
+  const cmd = (st.match(/^\\(\w+)/) || [])[1]; let s = st.replace(/^\\\w+/, ""); let opts = "";
+  const om = s.match(/^\s*\[([^\]]*)\]/); if (om) { opts = om[1]; s = s.slice(om[0].length); }
+  const style = tikzOptsStyle(opts, cmd);
+  let i = 0, cur = null, prev = null, start = null, rel = false;
+  const skip = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  const paren = () => { let d = 0, j = i; for (; j < s.length; j++) { if (s[j] === "(") d++; else if (s[j] === ")") { d--; if (d === 0) { j++; break; } } } const inner = s.slice(i + 1, j - 1); i = j; return inner; };
+  const brace = () => { let d = 0, j = i; for (; j < s.length; j++) { if (s[j] === "{") d++; else if (s[j] === "}") { d--; if (d === 0) { j++; break; } } } const inner = s.slice(i + 1, j - 1); i = j; return inner; };
+  const bracket = () => { const j = s.indexOf("]", i); const inner = s.slice(i + 1, j); i = j + 1; return inner; };
+  const segs = [];
+  while (i < s.length) {
+    skip(); if (i >= s.length || s[i] === ";") break;
+    if (s[i] === "+") { rel = true; i++; if (s[i] === "+") i++; skip(); continue; }
+    if (s[i] === "(") { let p = tikzCoord(paren(), coords); if (!p) return false; if (rel && cur) { p = [cur[0] + p[0], cur[1] + p[1]]; } rel = false; prev = cur; cur = p; if (!start) start = p; addPt(p[0], p[1]); segs.push({ t: segs.length ? "L" : "M", p }); continue; }
+    if (s.startsWith("--", i)) { i += 2; continue; }
+    if (s.startsWith("..", i)) {
+      i += 2; skip(); let c1 = null, c2 = null;
+      if (s.startsWith("controls", i)) { i += 8; skip(); if (s[i] === "(") c1 = tikzCoord(paren(), coords); skip(); if (s.startsWith("and", i)) { i += 3; skip(); if (s[i] === "(") c2 = tikzCoord(paren(), coords); } }
+      skip(); if (s.startsWith("..", i)) { i += 2; skip(); }
+      if (s[i] !== "(") return false; const p = tikzCoord(paren(), coords); if (!p || !cur) return false;
+      const cc1 = c1 || cur, cc2 = c2 || c1 || p; addPt(p[0], p[1]); addPt(cc1[0], cc1[1]); addPt(cc2[0], cc2[1]);
+      segs.push({ t: "C", p, c1: cc1, c2: cc2 }); prev = cur; cur = p; continue;
+    }
+    if (s.startsWith("cycle", i)) { i += 5; if (start) segs.push({ t: "L", p: start }); continue; }
+    if (s.startsWith("circle", i)) { i += 6; skip(); let r = null; if (s[i] === "(") r = tikzLen(paren()); else if (s[i] === "[") { const b = bracket(); const rm = b.match(/radius\s*=\s*([\d.a-z]+)/); if (rm) r = tikzLen(rm[1]); } if (r == null || !cur) return false; els.push({ kind: "circle", c: cur, r, style }); addPt(cur[0] - r, cur[1] - r); addPt(cur[0] + r, cur[1] + r); continue; }
+    if (s.startsWith("ellipse", i)) { i += 7; skip(); if (s[i] !== "(") return false; const inner = paren(); const em = inner.match(/([\d.]+\s*[a-z]*)\s*and\s*([\d.]+\s*[a-z]*)/i); if (!em || !cur) return false; const rx = tikzLen(em[1]), ry = tikzLen(em[2]); els.push({ kind: "ellipse", c: cur, rx, ry, style }); addPt(cur[0] - rx, cur[1] - ry); addPt(cur[0] + rx, cur[1] + ry); continue; }
+    if (s.startsWith("rectangle", i)) { i += 9; skip(); if (s[i] !== "(") return false; const p2 = tikzCoord(paren(), coords); if (!p2 || !cur) return false; els.push({ kind: "rect", a: cur, b: p2, style }); addPt(p2[0], p2[1]); prev = cur; cur = p2; continue; }
+    if (/^to\s*\[/.test(s.slice(i))) { const t0 = /^to\s*\[/.exec(s.slice(i))[0]; i += t0.length - 1; const topts = bracket(); skip(); const bp = (s[i] === "(") ? tikzCoord(paren(), coords) : null; if (!bp || !cur) return false; const tm = topts.match(/^\s*([A-Za-z][A-Za-z ]*?)\s*(?:=|,|\]|$)/); const type = (tm ? tm[1] : "short").trim().toLowerCase(); const lm = topts.match(/=\s*(\$[^$]*\$|[^,\]]+)/); els.push({ kind: "component", a: cur, b: bp, type, label: lm ? lm[1].trim() : "", style }); addPt(bp[0], bp[1]); prev = cur; cur = bp; continue; }
+    if (s.startsWith("node", i)) { i += 4; skip(); let nopts = ""; if (s[i] === "[") nopts = bracket(); skip(); if (s[i] === "(") { paren(); skip(); } if (s[i] === "{") { const txt = brace(); els.push({ kind: "node", at: cur, opts: nopts, text: txt, seg: { a: prev, b: cur } }); } continue; }
+    return false;
+  }
+  if (segs.length >= 2) els.unshift({ kind: "path", segs, style });
+  return true;
+}
+function tikzParseNode(st, coords, els, addPt) {
+  const m = st.match(/^\\node\s*(?:\[([^\]]*)\])?\s*(?:\(([^)]*)\)\s*)?(?:at\s*\(([^)]+)\))?\s*\{([\s\S]*)\}\s*$/);
+  if (!m) return false;
+  const opts = m[1] || "", at = m[3] ? tikzCoord(m[3], coords) : (m[2] && coords[m[2].trim()] ? coords[m[2].trim()] : null);
+  if (!at) return false;
+  addPt(at[0], at[1]);
+  els.push({ kind: "node", at, opts, text: m[4], seg: null });
+  return true;
+}
+/* Draw a circuitikz component (\draw (a) to[R=$R$] (b)) — the wire, the component symbol rotated to
+   the a→b direction, and an upright label above it. Handles R / C / L / battery / diode / switch. */
+function tikzEmitComponent(e, sx, sy) {
+  const ax = sx(e.a[0]), ay = sy(e.a[1]), bx = sx(e.b[0]), by = sy(e.b[1]);
+  const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy); if (len < 1) return "";
+  const ang = Math.atan2(dy, dx) * 180 / Math.PI;
+  const S = e.style || {}, col = S.stroke || "#111827", w = S.width || 1.4;
+  const L = (x1, y1, x2, y2) => `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${col}" stroke-width="${w}" stroke-linecap="round"/>`;
+  const t = e.type; let inner = "";
+  if (/^(r|resistor|european resistor|generic|vr|variable resistor)$/.test(t)) { const a = len * 0.32, b = len * 0.68, h = 6; inner = L(0, 0, a, 0) + `<rect x="${a.toFixed(1)}" y="${-h}" width="${(b - a).toFixed(1)}" height="${2 * h}" fill="none" stroke="${col}" stroke-width="${w}"/>` + L(b, 0, len, 0); }
+  else if (/^(c|capacitor|ec|capacitor1)$/.test(t)) { const a = len / 2 - 3.5, b = len / 2 + 3.5, h = 8; inner = L(0, 0, a, 0) + L(a, -h, a, h) + L(b, -h, b, h) + L(b, 0, len, 0); }
+  else if (/^(l|inductor|cute inductor|american inductor)$/.test(t)) { const a = len * 0.28, b = len * 0.72, seg = (b - a) / 4, r = seg / 2; let d = `M${a.toFixed(1)} 0`; for (let k = 0; k < 4; k++) d += ` A ${r.toFixed(1)} ${r.toFixed(1)} 0 0 1 ${(a + (k + 1) * seg).toFixed(1)} 0`; inner = L(0, 0, a, 0) + `<path d="${d}" fill="none" stroke="${col}" stroke-width="${w}"/>` + L(b, 0, len, 0); }
+  else if (/^(battery|batt|v|voltage|vsource|battery1|american voltage source)$/.test(t)) { const a = len / 2 - 4; inner = L(0, 0, a, 0) + L(a, -9, a, 9) + L(a + 6, -5, a + 6, 5) + L(a + 6, 0, len, 0); }
+  else if (/^(d|diode|empty diode|full diode)$/.test(t)) { const a = len * 0.36, b = len * 0.64, h = 7; inner = L(0, 0, a, 0) + `<path d="M${a.toFixed(1)} ${-h}L${b.toFixed(1)} 0L${a.toFixed(1)} ${h}z" fill="none" stroke="${col}" stroke-width="${w}"/>` + L(b, -h, b, h) + L(b, 0, len, 0); }
+  else if (/^(switch|spst|cspst|nos|nc)$/.test(t)) { const a = len * 0.35, b = len * 0.65; inner = L(0, 0, a, 0) + `<circle cx="${a.toFixed(1)}" cy="0" r="1.8" fill="${col}"/>` + L(a, 0, b, -7) + `<circle cx="${b.toFixed(1)}" cy="0" r="1.8" fill="${col}"/>` + L(b, 0, len, 0); }
+  else { inner = L(0, 0, len, 0); }
+  let lbl = "";
+  if (e.label) { const mx = (ax + bx) / 2, my = (ay + by) / 2; let px = -dy / len, py = dx / len; if (py > 0) { px = -px; py = -py; } lbl = `<text x="${(mx + px * 14).toFixed(1)}" y="${(my + py * 14 + 3).toFixed(1)}" text-anchor="middle" class="tikz-lbl">${escapeHtml(tikzLabelText(e.label))}</text>`; }
+  return `<g transform="translate(${ax.toFixed(1)} ${ay.toFixed(1)}) rotate(${ang.toFixed(1)})">${inner}</g>` + lbl;
+}
+function tikzEmit(e, sx, sy, PX, id) {
+  if (e.kind === "component") return tikzEmitComponent(e, sx, sy);
+  const S = e.style || {};
+  const attr = (s) => `stroke="${s.stroke}" stroke-width="${s.width}" fill="${s.fill}"` + (s.dash ? ` stroke-dasharray="${s.dash}"` : "") + (s.mE ? ` marker-end="url(#${id}e)"` : "") + (s.mS ? ` marker-start="url(#${id}s)"` : "");
+  if (e.kind === "path") { const d = e.segs.map((g) => g.t === "C" ? `C${sx(g.c1[0]).toFixed(1)} ${sy(g.c1[1]).toFixed(1)} ${sx(g.c2[0]).toFixed(1)} ${sy(g.c2[1]).toFixed(1)} ${sx(g.p[0]).toFixed(1)} ${sy(g.p[1]).toFixed(1)}` : g.t + sx(g.p[0]).toFixed(1) + " " + sy(g.p[1]).toFixed(1)).join(" "); return `<path d="${d}" ${attr(S)} stroke-linecap="round" stroke-linejoin="round"/>`; }
+  if (e.kind === "circle") return `<circle cx="${sx(e.c[0]).toFixed(1)}" cy="${sy(e.c[1]).toFixed(1)}" r="${(e.r * PX).toFixed(1)}" ${attr(S)}/>`;
+  if (e.kind === "ellipse") return `<ellipse cx="${sx(e.c[0]).toFixed(1)}" cy="${sy(e.c[1]).toFixed(1)}" rx="${(e.rx * PX).toFixed(1)}" ry="${(e.ry * PX).toFixed(1)}" ${attr(S)}/>`;
+  if (e.kind === "rect") { const x = Math.min(sx(e.a[0]), sx(e.b[0])), y = Math.min(sy(e.a[1]), sy(e.b[1])), w = Math.abs(sx(e.b[0]) - sx(e.a[0])), h = Math.abs(sy(e.b[1]) - sy(e.a[1])); return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${h.toFixed(1)}" rx="1.5" ${attr(S)}/>`; }
+  if (e.kind === "node") {
+    const o = e.opts || "";
+    if (/\bground\b/.test(o)) { const gx = sx(e.at[0]), gy = sy(e.at[1]); const GL = (a1, b1, a2, b2) => `<line x1="${a1.toFixed(1)}" y1="${b1.toFixed(1)}" x2="${a2.toFixed(1)}" y2="${b2.toFixed(1)}" stroke="#111827" stroke-width="1.5"/>`; return GL(gx, gy, gx, gy + 3) + GL(gx - 8, gy + 3, gx + 8, gy + 3) + GL(gx - 5, gy + 6, gx + 5, gy + 6) + GL(gx - 2.5, gy + 9, gx + 2.5, gy + 9); }
+    let at = e.at;
+    if (/midway|pos\s*=|near/.test(o) && e.seg && e.seg.a && e.seg.b) at = [(e.seg.a[0] + e.seg.b[0]) / 2, (e.seg.a[1] + e.seg.b[1]) / 2];
+    let x = sx(at[0]), y = sy(at[1]) + 4, anc = "middle";
+    if (/above/.test(o)) y -= 13; if (/below/.test(o)) y += 12;
+    if (/right/.test(o)) { x += 8; anc = "start"; } if (/left/.test(o)) { x -= 8; anc = "end"; }
+    return `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" text-anchor="${anc}" class="tikz-lbl">${escapeHtml(tikzLabelText(e.text))}</text>`;
+  }
+  return "";
+}
+function renderTikzToSvg(raw) {
+  try {
+    const M = String(raw).match(/\\begin\{tikzpicture\}\s*(\[[^\]]*\])?([\s\S]*?)\\end\{tikzpicture\}/);
+    let gOpts = "", body;
+    if (M) { gOpts = M[1] || ""; body = M[2]; } else { body = String(raw); }
+    body = body.replace(/(^|[^\\])%[^\n]*/g, "$1");
+    const scale = parseFloat((gOpts.match(/scale\s*=\s*([\d.]+)/) || [])[1]) || 1;
+    body = tikzExpandForeach(body);
+    // Bail on features we don't interpret → TikZJax fallback.
+    if (/\\begin\{/.test(body)) return null;
+    if (/=\s*[\d.]+\s*(?:cm|pt|mm)?\s+of\s+/.test(body)) return null;      // right=1cm of X
+    if (/\)\s*\.\s*(?:east|west|north|south|center|anchor)/i.test(body)) return null; // node anchors
+    if (/\barc\b|\bplot\b|\bgrid\b|\\path|\\clip|\\shade|pic\s*\{/.test(body)) return null;
+    const coords = Object.create(null), els = [], pts = [];
+    const addPt = (x, y) => { if (isFinite(x) && isFinite(y)) pts.push([x, y]); };
+    for (let st of tikzSplitStatements(body)) {
+      st = st.trim(); if (!st) continue;
+      if (/^\\coordinate\b/.test(st)) { if (!tikzParseCoordinate(st, coords)) return null; continue; }
+      if (/^\\(draw|fill|filldraw)\b/.test(st)) { if (!tikzParsePath(st, coords, els, addPt)) return null; continue; }
+      if (/^\\node\b/.test(st)) { if (!tikzParseNode(st, coords, els, addPt)) return null; continue; }
+      if (/^\\(useasboundingbox|def|tikzset|pgfmath)/.test(st)) continue;
+      if (/^\\/.test(st)) return null;
+    }
+    if (!els.length || !pts.length) return null;
+    let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    pts.forEach((p) => { minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]); minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]); });
+    if (!(maxX > minX)) maxX = minX + 1; if (!(maxY > minY)) maxY = minY + 1;
+    const PX = 42 * scale, pad = 22;
+    const W = (maxX - minX) * PX + pad * 2, H = (maxY - minY) * PX + pad * 2;
+    if (W > 6000 || H > 6000 || W < 8 || H < 8) return null;
+    const sx = (x) => pad + (x - minX) * PX, sy = (y) => pad + (maxY - y) * PX;
+    const id = "tk" + (tikzSeq++);
+    let g = ""; els.forEach((e) => { g += tikzEmit(e, sx, sy, PX, id); });
+    const mk = (mid, rev) => `<marker id="${mid}" viewBox="0 0 10 10" refX="${rev ? 1 : 9}" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="${rev ? "M10 0L0 5L10 10z" : "M0 0L10 5L0 10z"}" fill="context-stroke"/></marker>`;
+    return `<svg viewBox="0 0 ${W.toFixed(1)} ${H.toFixed(1)}" xmlns="http://www.w3.org/2000/svg" class="tikz-svg" role="img">` +
+      `<defs><marker id="${id}e" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z"/></marker>` +
+      `<marker id="${id}s" viewBox="0 0 10 10" refX="1.5" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M10 0L0 5L10 10z"/></marker></defs>` + g + `</svg>`;
+  } catch (_) { return null; }
+}
+
+function looksLikeTikz(lang, src) {
+  if (/^tikz(picture)?$/i.test(lang)) return true;
+  if (/^(tex|latex)$/i.test(lang) && /\\begin\s*\{tikzpicture\}/.test(src || "")) return true;
+  return false;
+}
+
+/* Convert a <pre><code> TikZ block into a pending <figure>. Returns true if handled. */
+function tikzifyCodeBlock(code) {
+  if (!code || code.hasAttribute("data-tikz-skip")) return false;
+  const pre = code.parentElement;
+  const lang = ((code.className || "").match(/language-([\w-]+)/) || [])[1] || "";
+  const src = code.textContent || "";
+  if (!pre || !looksLikeTikz(lang, src)) return false;
+  const body = /\\begin\s*\{tikzpicture\}/.test(src)
+    ? src
+    : "\\begin{tikzpicture}\n" + src + "\n\\end{tikzpicture}";
+  // Try OUR instant mini-TikZ renderer first — zero delay, no engine. Only falls back to the heavy
+  // TikZJax engine when it meets something our renderer can't interpret.
+  const fastSvg = renderTikzToSvg(body);
+  if (fastSvg) {
+    // An EMPTY PLACEHOLDER (one bare shape, no labels — the model "drew" just a frame) is worse
+    // than no figure: drop the block entirely instead of showing an empty box in the document.
+    const drawn = fastSvg.slice(fastSvg.indexOf("</defs>"));   // skip arrow-marker defs
+    const shapeCount = (drawn.match(/<(rect|circle|ellipse|path|line)\b/g) || []).length;
+    const textCount = (drawn.match(/<text\b/g) || []).length;
+    if (shapeCount <= 1 && textCount === 0) { pre.remove(); return true; }
+    const figFast = document.createElement("figure");
+    figFast.className = "tikz-figure";
+    figFast.innerHTML = fastSvg;
+    pre.replaceWith(figFast);
+    return true;
+  }
+  const fig = document.createElement("figure");
+  fig.className = "tikz-figure";
+  fig.setAttribute("data-tikz-pending", "1");
+  fig.setAttribute("data-tikz-src", src);
+  const spin = document.createElement("div");
+  spin.className = "tikz-figure__spin";
+  spin.textContent = "◌";
+  const script = document.createElement("script");
+  script.type = "text/tikz";
+  script.textContent = body;
+  fig.appendChild(spin);
+  fig.appendChild(script);
+  pre.replaceWith(fig);
+  if (tikzLoadFailed) tikzFallback(fig);
+  else watchTikzFigure(fig);
+  return true;
+}
+
+/* Engine failed / timed out → show the source as a plain code box (nothing lost). */
+function tikzFallback(fig) {
+  if (!fig || !fig.parentNode) return;
+  const src = fig.getAttribute("data-tikz-src") || "";
+  const pre = document.createElement("pre");
+  const code = document.createElement("code");
+  code.className = "language-tikz";
+  code.setAttribute("data-tikz-skip", "1");   // don't re-tikzify on a later decorate pass
+  code.textContent = src;
+  pre.appendChild(code);
+  fig.replaceWith(pre);
+}
+
+/* Resolve a figure when its SVG appears; fall back on timeout. */
+function watchTikzFigure(fig) {
+  let done = false;
+  const finish = (ok) => {
+    if (done) return; done = true;
+    try { obs.disconnect(); } catch (_) {}
+    clearTimeout(to);
+    if (ok) {
+      fig.removeAttribute("data-tikz-pending");
+      const s = fig.querySelector(".tikz-figure__spin"); if (s) s.remove();
+    } else {
+      tikzFallback(fig);
+    }
+  };
+  const obs = new MutationObserver(() => { if (fig.querySelector("svg")) finish(true); });
+  obs.observe(fig, { childList: true, subtree: true });
+  const to = setTimeout(() => finish(!!fig.querySelector("svg")), 60000);  // first load pulls a few-MB TeX core
+  if (fig.querySelector("svg")) finish(true);
+}
+
+/* Render any pending <script type="text/tikz">. TikZJax gates its own processing
+   on window.onload — which fires only ONCE, at initial page load — so for figures
+   added dynamically later we load the engine ONCE, capture that processing function,
+   and invoke it ourselves for every new batch. The captured fn re-scans the DOM and
+   reuses the already-loaded WASM, so repeat calls are cheap. Debounced. */
+let tikzProcess = null;   // captured TikZJax processing fn
+let tikzLoading = false;
+function scheduleTikz() {
+  if (tikzLoadFailed) return;
+  if (!document.querySelector('.tikz-figure[data-tikz-pending] script[type="text/tikz"]')) return;
+  if (tikzTimer) clearTimeout(tikzTimer);
+  tikzTimer = setTimeout(runTikz, 120);
+}
+function runTikz() {
+  if (tikzProcess) { try { tikzProcess(); } catch (_) {} return; }
+  if (tikzLoading) return;
+  tikzLoading = true;
+  if (!document.getElementById("tikzjax-css")) {
+    const l = document.createElement("link");
+    l.id = "tikzjax-css"; l.rel = "stylesheet"; l.href = TIKZJAX_CSS;
+    document.head.appendChild(l);
+  }
+  const s = document.createElement("script");
+  s.id = "tikzjax-js"; s.src = TIKZJAX_JS; s.async = true;
+  s.onload = () => {
+    tikzLoading = false;
+    // TikZJax assigns its processor to window.onload on execution; capture & run it.
+    if (typeof window.onload === "function") {
+      tikzProcess = window.onload;
+      try { tikzProcess(); } catch (_) {}
+    } else {
+      tikzLoadFailed = true;
+      document.querySelectorAll(".tikz-figure[data-tikz-pending]").forEach(tikzFallback);
+    }
+  };
+  s.onerror = () => {
+    tikzLoading = false;
+    tikzLoadFailed = true;
+    document.querySelectorAll(".tikz-figure[data-tikz-pending]").forEach(tikzFallback);
+  };
+  document.body.appendChild(s);
+}
+
+/* Wait until no TikZ figure is still pending (called before exporting a file/PDF). */
+function tikzReady(timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (!document.querySelector(".tikz-figure[data-tikz-pending]")) return resolve();
+      if (Date.now() - t0 > (timeoutMs || 8000)) return resolve();
+      setTimeout(tick, 150);
+    };
+    tick();
+  });
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   INSTANT FUNCTION GRAPHS — render a ```plot block to an SVG SYNCHRONOUSLY (no engine,
+   no network, no delay; it draws the moment the message appears). Block body = one or
+   more `y = <expr>` lines + an optional `domain: a..b`. Built so "graph this function"
+   never waits on the heavy TeX engine. */
+function compilePlotExpr(src) {
+  const F = { sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos,
+    atan: Math.atan, arcsin: Math.asin, arccos: Math.acos, arctan: Math.atan, tg: Math.tan,
+    cot: (v) => 1 / Math.tan(v), cotan: (v) => 1 / Math.tan(v), ctg: (v) => 1 / Math.tan(v),
+    sec: (v) => 1 / Math.cos(v), csc: (v) => 1 / Math.sin(v), cosec: (v) => 1 / Math.sin(v),
+    sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh, asinh: Math.asinh, acosh: Math.acosh,
+    atanh: Math.atanh, exp: Math.exp, ln: Math.log, log: (v) => Math.log(v) / Math.LN10,
+    lg: (v) => Math.log(v) / Math.LN10, log2: (v) => Math.log(v) / Math.LN2, log10: (v) => Math.log(v) / Math.LN10,
+    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, sign: Math.sign, floor: Math.floor,
+    ceil: Math.ceil, round: Math.round };
+  const C = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI };
+  let s = String(src).replace(/\s+/g, "").toLowerCase();
+  if (!s) return null;
+  s = s.replace(/\*\*/g, "^").replace(/(\d)([x(])/g, "$1*$2").replace(/\)([x(\d.])/g, ")*$1").replace(/x([x(])/g, "x*$1");
+  let i = 0;
+  function expr() { let a = term(); while (s[i] === "+" || s[i] === "-") { const o = s[i++], b = term(), A = a, B = b; a = o === "+" ? (x) => A(x) + B(x) : (x) => A(x) - B(x); } return a; }
+  function term() { let a = unary(); while (s[i] === "*" || s[i] === "/") { const o = s[i++], b = unary(), A = a, B = b; a = o === "*" ? (x) => A(x) * B(x) : (x) => A(x) / B(x); } return a; }
+  function unary() { if (s[i] === "-") { i++; const A = unary(); return (x) => -A(x); } if (s[i] === "+") { i++; return unary(); } return power(); }
+  function power() { const a = atom(); if (s[i] === "^") { i++; const b = unary(), A = a, B = b; return (x) => Math.pow(A(x), B(x)); } return a; }
+  function atom() {
+    if (s[i] === "(") { i++; const e = expr(); if (s[i] !== ")") throw 0; i++; return e; }
+    let m = /^[0-9]*\.?[0-9]+/.exec(s.slice(i));
+    if (m) { i += m[0].length; const v = parseFloat(m[0]); return () => v; }
+    m = /^[a-z_][a-z0-9_]*/.exec(s.slice(i));
+    if (m) {
+      const n = m[0]; i += n.length;
+      if (n === "x") return (x) => x;
+      if (Object.prototype.hasOwnProperty.call(C, n)) { const v = C[n]; return () => v; }
+      if (Object.prototype.hasOwnProperty.call(F, n)) { if (s[i] !== "(") throw 0; i++; const a = expr(); if (s[i] !== ")") throw 0; i++; const f = F[n], A = a; return (x) => f(A(x)); }
+      throw 0;
+    }
+    throw 0;
+  }
+  try { const fn = expr(); if (i !== s.length) return null; const v = fn(0.5); if (typeof v !== "number") return null; return fn; }
+  catch (_) { return null; }
+}
+
+/* Convert a plot-syntax expression into pretty LaTeX (for the KaTeX legend). Mirrors the
+   grammar of compilePlotExpr but emits LaTeX instead of a function. Returns null on failure. */
+function plotExprToLatex(src) {
+  const FN = { sqrt: 1, cbrt: 1, exp: 1, abs: 1, floor: 1, ceil: 1,
+    sin: "\\sin", cos: "\\cos", tan: "\\tan", sec: "\\sec", csc: "\\csc", cot: "\\cot", tg: "\\tan", ctg: "\\cot", cosec: "\\csc",
+    asin: "\\arcsin", acos: "\\arccos", atan: "\\arctan", arcsin: "\\arcsin", arccos: "\\arccos", arctan: "\\arctan",
+    sinh: "\\sinh", cosh: "\\cosh", tanh: "\\tanh", asinh: "\\operatorname{arsinh}", acosh: "\\operatorname{arcosh}", atanh: "\\operatorname{artanh}",
+    ln: "\\ln", log: "\\log", lg: "\\log", log2: "\\log_{2}", log10: "\\log_{10}", sign: "\\operatorname{sgn}", round: "\\operatorname{round}" };
+  const CN = { pi: "\\pi", e: "e", tau: "\\tau" };
+  let s = String(src).replace(/\s+/g, "").toLowerCase();
+  if (!s) return null;
+  s = s.replace(/\*\*/g, "^").replace(/(\d)([x(])/g, "$1*$2").replace(/\)([x(\d.])/g, ")*$1").replace(/x([x(])/g, "x*$1");
+  let i = 0;
+  const isNum = (t) => /^[0-9.]+$/.test(t);
+  function expr() { let a = term(); while (s[i] === "+" || s[i] === "-") { const o = s[i++], b = term(); a = a + " " + o + " " + b; } return a; }
+  function term() { let a = unary(); while (s[i] === "*" || s[i] === "/") { const o = s[i++], b = unary(); a = o === "/" ? "\\frac{" + a + "}{" + b + "}" : (isNum(a) && isNum(b) ? a + " \\cdot " + b : a + " " + b); } return a; }
+  function unary() { if (s[i] === "-") { i++; return "-" + unary(); } if (s[i] === "+") { i++; return unary(); } return power(); }
+  function power() { const a = atom(); if (s[i] === "^") { i++; const b = unary(); return a + "^{" + b + "}"; } return a; }
+  function atom() {
+    if (s[i] === "(") { i++; const e = expr(); if (s[i] !== ")") throw 0; i++; return "\\left(" + e + "\\right)"; }
+    let m = /^[0-9]*\.?[0-9]+/.exec(s.slice(i));
+    if (m) { i += m[0].length; return m[0]; }
+    m = /^[a-z_][a-z0-9_]*/.exec(s.slice(i));
+    if (m) {
+      const n = m[0]; i += n.length;
+      if (n === "x") return "x";
+      if (Object.prototype.hasOwnProperty.call(CN, n)) return CN[n];
+      if (Object.prototype.hasOwnProperty.call(FN, n)) {
+        if (s[i] !== "(") throw 0; i++; const a = expr(); if (s[i] !== ")") throw 0; i++;
+        if (n === "sqrt") return "\\sqrt{" + a + "}";
+        if (n === "cbrt") return "\\sqrt[3]{" + a + "}";
+        if (n === "exp") return "e^{" + a + "}";
+        if (n === "abs") return "\\left|" + a + "\\right|";
+        if (n === "floor") return "\\left\\lfloor " + a + "\\right\\rfloor";
+        if (n === "ceil") return "\\left\\lceil " + a + "\\right\\rceil";
+        return FN[n] + "\\left(" + a + "\\right)";
+      }
+      throw 0;
+    }
+    throw 0;
+  }
+  try { const out = expr(); if (i !== s.length) return null; return out; } catch (_) { return null; }
+}
+
+/* Wrap the math parts of a free-text title ("y = exp(-x^2/8)·sin(5x) …") in \(…\) so KaTeX
+   renders them as pretty math; Arabic/prose stays as-is. Best-effort — unparseable runs untouched. */
+function mathifyTitle(title) {
+  if (!title) return title || "";
+  const s = String(title).replace(/[·×]/g, "*");
+  return s.replace(
+    /(±\s*)?\b([A-Za-z](?:\s*\(\s*x\s*\))?)\s*=\s*(±?\s*[-+*/^().0-9A-Za-z\s]+?)(?=$|[,،؛;]|\s*[؀-ۿ]|\s(?:for|with|on|from|to|where|and)\b)/g,
+    function (m, pm, lhs, rhs) {
+      const neg = /^\s*±/.test(rhs) ? "\\pm " : (/^\s*-/.test(rhs) ? "-" : "");
+      const tex = plotExprToLatex(rhs.replace(/^[\s±+\-]+/, ""));
+      if (!tex) return m;
+      return "\\(" + (pm ? "\\pm " : "") + lhs.replace(/\s+/g, "") + " = " + neg + tex + "\\)";
+    }
+  );
+}
+
+let plotSeq = 0;
+const PLOT_W = 480, PLOT_H = 300, PLOT_L = 46, PLOT_R = 16, PLOT_T = 16, PLOT_B = 28;
+const PLOT_PW = PLOT_W - PLOT_L - PLOT_R, PLOT_PH = PLOT_H - PLOT_T - PLOT_B;
+// Fallback colors baked in: if the --plot-cN custom property fails to cascade (e.g. in a print
+// context), stroke:var(--plot-c1) would fall back to "none" → an INVISIBLE curve ("no graph").
+const PLOT_PAL = ["var(--plot-c1,#237a68)", "var(--plot-c2,#3b82f6)", "var(--plot-c3,#ef4444)", "var(--plot-c4,#d97706)", "var(--plot-c5,#7c3aed)"];
+
+/* Parse a plot spec → { fns:[{fn,expr,color}], dom:[a,b] } (or null if no function parses). */
+function parsePlotSpec(spec) {
+  const fns = []; let dom = null;
+  String(spec).split(/\r?\n/).forEach((ln) => {
+    ln = ln.trim(); if (!ln || /^(#|\/\/)/.test(ln)) return;
+    const m = /^(?:domain|x)\s*[:=]\s*(-?[0-9.]+)\s*(?:\.\.|,|to|:)\s*(-?[0-9.]+)/i.exec(ln)
+           || /^(-?[0-9.]+)\s*(?:\.\.|to)\s*(-?[0-9.]+)$/i.exec(ln);
+    if (m) { const a = parseFloat(m[1]), b = parseFloat(m[2]); if (isFinite(a) && isFinite(b) && a < b) dom = [a, b]; return; }
+    const e = ln.replace(/^[a-z]\s*\(\s*x\s*\)\s*=/i, "").replace(/^y\s*=/i, "").trim();
+    const fn = compilePlotExpr(e);
+    if (fn) fns.push({ fn: fn, expr: e, color: PLOT_PAL[fns.length % PLOT_PAL.length] });
+  });
+  if (!fns.length) return null;
+  return { fns: fns, dom: dom || [-6, 6] };
+}
+
+/* Auto y-range for fns over [x0,x1] — percentile-clipped so asymptotes don't dominate. */
+function plotAutoY(fns, x0, x1) {
+  const N = 500, all = [];
+  for (let k = 0; k <= N; k++) { const x = x0 + (x1 - x0) * k / N; for (let j = 0; j < fns.length; j++) { let y; try { y = fns[j].fn(x); } catch (_) { y = NaN; } if (typeof y === "number" && isFinite(y)) all.push(y); } }
+  if (!all.length) return { ymin: -1, ymax: 1 };
+  all.sort((a, b) => a - b);
+  let ymin = all[Math.floor(all.length * 0.02)], ymax = all[Math.min(all.length - 1, Math.ceil(all.length * 0.98))];
+  if (!(ymin < ymax)) { ymin = all[0]; ymax = all[all.length - 1]; }
+  if (!(ymin < ymax)) { ymin -= 1; ymax += 1; }
+  const pad = (ymax - ymin) * 0.1 || 1; ymin -= pad; ymax += pad;
+  if (ymin > 0 && ymin < pad * 4) ymin = 0;
+  if (ymax < 0 && ymax > -pad * 4) ymax = 0;
+  return { ymin: ymin, ymax: ymax };
+}
+
+/* Render the SVG for fns at an explicit view {xmin,xmax,ymin,ymax}. Pure — re-run on pan/zoom. */
+function plotSvgString(fns, view) {
+  const xmin = view.xmin, xmax = view.xmax, ymin = view.ymin, ymax = view.ymax;
+  const W = PLOT_W, H = PLOT_H, L = PLOT_L, T = PLOT_T, pw = PLOT_PW, ph = PLOT_PH;
+  const sx = (x) => L + (x - xmin) / (xmax - xmin) * pw;
+  const sy = (y) => T + (ymax - y) / (ymax - ymin) * ph;
+  const nice = (range, n) => { const raw = range / n, mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10)), u = raw / mag; return (u < 1.5 ? 1 : u < 3 ? 2 : u < 7 ? 5 : 10) * mag; };
+  const fmt = (v) => { const r = Math.round(v * 1000) / 1000; return String(Math.abs(r) < 1e-9 ? 0 : r); };
+  const xStep = nice(xmax - xmin, 8), yStep = nice(ymax - ymin, 6);
+  const id = "pl" + (plotSeq++);
+  let grid = "", ax = "", curves = "";
+  for (let x = Math.ceil(xmin / xStep) * xStep; x <= xmax + 1e-9; x += xStep) {
+    const X = sx(x); grid += `<line class="plot-grid" x1="${X.toFixed(1)}" y1="${T}" x2="${X.toFixed(1)}" y2="${(T + ph).toFixed(1)}"/>`;
+    if (Math.abs(x) > 1e-9) grid += `<text class="plot-tick" x="${X.toFixed(1)}" y="${(T + ph + 14).toFixed(1)}" text-anchor="middle">${fmt(x)}</text>`;
+  }
+  for (let y = Math.ceil(ymin / yStep) * yStep; y <= ymax + 1e-9; y += yStep) {
+    const Y = sy(y); grid += `<line class="plot-grid" x1="${L}" y1="${Y.toFixed(1)}" x2="${(L + pw).toFixed(1)}" y2="${Y.toFixed(1)}"/>`;
+    if (Math.abs(y) > 1e-9) grid += `<text class="plot-tick" x="${(L - 5).toFixed(1)}" y="${(Y + 3).toFixed(1)}" text-anchor="end">${fmt(y)}</text>`;
+  }
+  if (0 >= ymin && 0 <= ymax) { const Y = sy(0); ax += `<line class="plot-axis" x1="${L}" y1="${Y.toFixed(1)}" x2="${(L + pw).toFixed(1)}" y2="${Y.toFixed(1)}" marker-end="url(#${id}a)"/><text class="plot-axislabel" x="${(L + pw - 3).toFixed(1)}" y="${(Y - 6).toFixed(1)}" text-anchor="end">x</text>`; }
+  if (0 >= xmin && 0 <= xmax) { const X = sx(0); ax += `<line class="plot-axis" x1="${X.toFixed(1)}" y1="${(T + ph).toFixed(1)}" x2="${X.toFixed(1)}" y2="${T}" marker-end="url(#${id}a)"/><text class="plot-axislabel" x="${(X + 7).toFixed(1)}" y="${(T + 9).toFixed(1)}">y</text>`; }
+  const N = 500, span = ymax - ymin;
+  fns.forEach((f) => {
+    let d = "", up = true;
+    for (let k = 0; k <= N; k++) { const x = xmin + (xmax - xmin) * k / N; let y; try { y = f.fn(x); } catch (_) { y = NaN; } if (typeof y !== "number" || !isFinite(y) || y < ymin - span || y > ymax + span) { up = true; continue; } const X = sx(x), Y = sy(Math.max(ymin, Math.min(ymax, y))); d += (up ? "M" : "L") + X.toFixed(1) + " " + Y.toFixed(1) + " "; up = false; }
+    if (d) curves += `<path class="plot-curve" style="stroke:${f.color}" d="${d}"/>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="function graph">` +
+    `<defs><clipPath id="${id}c"><rect x="${L}" y="${T}" width="${pw}" height="${ph}"/></clipPath>` +
+    `<marker id="${id}a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path class="plot-arrow" d="M0 0L10 5L0 10z"/></marker></defs>` +
+    `<rect class="plot-bg" x="${L}" y="${T}" width="${pw}" height="${ph}" rx="6"/>` +
+    grid + ax + `<g clip-path="url(#${id}c)">${curves}</g>` + `</svg>`;
+}
+
+/* Back-compat: render straight from a spec at the auto view. */
+function renderPlotSvg(spec) {
+  const p = parsePlotSpec(spec); if (!p) return null;
+  const ay = plotAutoY(p.fns, p.dom[0], p.dom[1]);
+  return plotSvgString(p.fns, { xmin: p.dom[0], xmax: p.dom[1], ymin: ay.ymin, ymax: ay.ymax });
+}
+
+/* Make a rendered plot pan/zoomable: mouse drag + wheel; touch one-finger pan + two-finger pinch;
+   double-click or the ⟲ button resets to the home view. Re-renders each frame so axes stay crisp. */
+function makePlotInteractive(fig, fns, home) {
+  const mk = () => ({ xmin: home.xmin, xmax: home.xmax, ymin: home.ymin, ymax: home.ymax });
+  let view = mk(), target = mk(), raf = 0, anim = 0;
+  const drawNow = () => { const old = fig.querySelector("svg"); if (!old) return; const tmp = document.createElement("div"); tmp.innerHTML = plotSvgString(fns, view); const ns = tmp.firstElementChild; if (ns) fig.replaceChild(ns, old); };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; drawNow(); }); };
+  // Ease `view` toward `target` over a few frames → smooth zoom (pan sets both directly = no lag).
+  const step = () => {
+    anim = 0; const k = 0.32; let moving = false;
+    for (const p of ["xmin", "xmax", "ymin", "ymax"]) {
+      const d = target[p] - view[p], eps = Math.max(1e-4, Math.abs(target[p]) * 2e-4);
+      if (Math.abs(d) > eps) { view[p] += d * k; moving = true; } else view[p] = target[p];
+    }
+    drawNow();
+    if (moving) anim = requestAnimationFrame(step);
+  };
+  const ease = () => { if (!anim) anim = requestAnimationFrame(step); };
+  const stopAnim = () => { if (anim) { cancelAnimationFrame(anim); anim = 0; } target = { xmin: view.xmin, xmax: view.xmax, ymin: view.ymin, ymax: view.ymax }; };
+  const dataAt = (cx, cy) => { const svg = fig.querySelector("svg"), r = svg.getBoundingClientRect(); const vx = (cx - r.left) / r.width * PLOT_W, vy = (cy - r.top) / r.height * PLOT_H; return { x: view.xmin + (vx - PLOT_L) / PLOT_PW * (view.xmax - view.xmin), y: view.ymax - (vy - PLOT_T) / PLOT_PH * (view.ymax - view.ymin) }; };
+  const zoomAt = (cx, cy, factor) => {
+    const d = dataAt(cx, cy);
+    const x0 = d.x - (d.x - target.xmin) * factor, x1 = d.x + (target.xmax - d.x) * factor;
+    const y0 = d.y - (d.y - target.ymin) * factor, y1 = d.y + (target.ymax - d.y) * factor;
+    if (x1 - x0 < 1e-7 || x1 - x0 > 1e9 || y1 - y0 < 1e-7 || y1 - y0 > 1e9) return;
+    target.xmin = x0; target.xmax = x1; target.ymin = y0; target.ymax = y1; ease();
+  };
+  fig.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 100;   // lines/pages → ~pixels
+    dy = Math.max(-100, Math.min(100, dy));                                    // clamp one notch
+    zoomAt(e.clientX, e.clientY, Math.exp(dy * 0.0011));                       // proportional + eased (smooth)
+  }, { passive: false });
+  const pts = new Map(); let pan = null, pinch = null;
+  fig.addEventListener("pointerdown", (e) => {
+    if (e.target.closest && e.target.closest(".plot-reset")) return;
+    try { fig.setPointerCapture(e.pointerId); } catch (_) {}
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    stopAnim();
+    if (pts.size === 1) { pan = { x: e.clientX, y: e.clientY, v: Object.assign({}, view) }; pinch = null; }
+    else if (pts.size === 2) { const a = [...pts.values()]; pinch = { d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) }; pan = null; }
+    fig.classList.add("plot-grabbing");
+  });
+  fig.addEventListener("pointermove", (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const a = [...pts.values()];
+    if (a.length === 2 && pinch) {
+      const nd = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y), cx = (a[0].x + a[1].x) / 2, cy = (a[0].y + a[1].y) / 2;
+      if (nd > 0 && pinch.d > 0) zoomAt(cx, cy, pinch.d / nd);
+      pinch.d = nd;
+    } else if (a.length === 1 && pan) {
+      const svg = fig.querySelector("svg"), r = svg.getBoundingClientRect();
+      const dx = (e.clientX - pan.x) / r.width * PLOT_W / PLOT_PW * (pan.v.xmax - pan.v.xmin);
+      const dy = (e.clientY - pan.y) / r.height * PLOT_H / PLOT_PH * (pan.v.ymax - pan.v.ymin);
+      view = { xmin: pan.v.xmin - dx, xmax: pan.v.xmax - dx, ymin: pan.v.ymin + dy, ymax: pan.v.ymax + dy };
+      target = { xmin: view.xmin, xmax: view.xmax, ymin: view.ymin, ymax: view.ymax };
+      schedule();
+    }
+  });
+  const endP = (e) => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; if (pts.size === 0) { pan = null; fig.classList.remove("plot-grabbing"); } };
+  fig.addEventListener("pointerup", endP); fig.addEventListener("pointercancel", endP);
+  fig.addEventListener("dblclick", (e) => { e.preventDefault(); target = mk(); ease(); });
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "plot-reset"; btn.textContent = "⟲";
+  btn.title = (typeof state !== "undefined" && state.lang === "ar") ? "إعادة الضبط" : "Reset view";
+  btn.addEventListener("click", (e) => { e.stopPropagation(); target = mk(); ease(); });
+  fig.appendChild(btn);
+}
+
+/* Convert a <pre><code class="language-plot"> block into an instant SVG graph. Returns true if handled. */
+function plotifyCodeBlock(code) {
+  if (!code) return false;
+  const lang = ((code.className || "").match(/language-([\w-]+)/) || [])[1] || "";
+  if (!/^(plot|graph|funcplot)$/i.test(lang)) return false;
+  const pre = code.parentElement; if (!pre) return false;
+  const p = parsePlotSpec(code.textContent || "");
+  if (!p) return false; // couldn't parse a function → leave as a normal code box
+  const ay = plotAutoY(p.fns, p.dom[0], p.dom[1]);
+  const home = { xmin: p.dom[0], xmax: p.dom[1], ymin: ay.ymin, ymax: ay.ymax };
+  const fig = document.createElement("figure");
+  fig.className = "tikz-figure plot-figure plot-interactive";
+  fig.innerHTML = plotSvgString(p.fns, home);
+  // Beautiful math legend (HTML + KaTeX overlay) — built once, stays fixed during pan/zoom.
+  const leg = document.createElement("div");
+  leg.className = "plot-legend";
+  p.fns.forEach((f) => {
+    const row = document.createElement("div"); row.className = "plot-legend__row";
+    const sw = document.createElement("span"); sw.className = "plot-legend__sw"; sw.style.background = f.color;
+    const lb = document.createElement("span"); lb.className = "plot-legend__lb";
+    const tex = plotExprToLatex(f.expr);
+    lb.textContent = tex ? ("\\(y = " + tex + "\\)") : ("y = " + f.expr);
+    row.appendChild(sw); row.appendChild(lb); leg.appendChild(row);
+  });
+  fig.appendChild(leg);
+  typesetMath(leg);
+  pre.replaceWith(fig);
+  try { makePlotInteractive(fig, p.fns, home); } catch (_) {}
+  return true;
 }
 
 /** Copy text to the clipboard. Returns a promise that resolves true on success.
@@ -1687,6 +2361,7 @@ function ensureActiveChat(firstUserText) {
       id: uid(),          // local handle for activeId/DOM until server id arrives
       serverId: null,     // set after first POST /api/chats
       title: titleFrom(firstUserText),
+      agent: state.product === "agent",   // Firas Agent tasks live in their own list
       createdAt: Date.now(),
       updatedAt: Date.now(),
       messages: [],
@@ -1796,6 +2471,7 @@ function applyShellLang(lang) {
     if (t()[key]) el.setAttribute("title", t()[key]);
   });
   els.searchInput.setAttribute("placeholder", t().searchPlaceholder);
+  if (typeof updateProductUi === "function") updateProductUi(); // product wordmarks + agent placeholder
   if (els.modeSwitch) buildModeSwitch(); // re-localize Auto/Plan labels + hints
   applyThink();                       // re-localize the thinking tooltip
   if (authEls.screen && !authEls.screen.hidden) renderAuthCopy();
@@ -2275,7 +2951,8 @@ function renderHistory() {
   const list = els.historyList;
   list.innerHTML = "";
   const q = state.search.trim().toLowerCase();
-  let chats = state.chats.slice().sort((a, b) => b.updatedAt - a.updatedAt);
+  // Each PRODUCT owns its chats: Firas Agent tasks never mix with Firas AI conversations.
+  let chats = state.chats.filter((c) => !!c.agent === (state.product === "agent")).sort((a, b) => b.updatedAt - a.updatedAt);
   if (q) chats = chats.filter((c) => (c.title || "").toLowerCase().includes(q));
 
   if (!chats.length) {
@@ -2434,6 +3111,23 @@ function renderWelcome() {
   els.thread.classList.add("hidden");
   const w = els.welcome;
   w.classList.remove("hidden");
+  if (state.product === "agent") {
+    // Firas Agent home: its own identity + task starters — a different environment.
+    const ar = state.lang === "ar";
+    const starters = ar
+      ? ["سوّي كورس كامل لتعلم التفاضل مع رسوم وتمارين", "اكتب بحثًا جامعيًا 20 صفحة بمصادر من الويب", "حضّر ملزمة فيزياء شاملة من مكتبتي المرجعية", "ابنِ موقعًا كاملًا متعدد الأقسام"]
+      : ["Build a full calculus course with figures & exercises", "Write a 20-page cited research paper", "Prepare a complete physics study booklet", "Build a full multi-section website"];
+    w.innerHTML = `
+      <div class="welcome agent-welcome">
+        <span class="nib welcome__mark" data-size="lg" aria-hidden="true"><span class="glyph">F</span></span>
+        <h1 class="welcome__title">Firas <span class="agent-welcome__grad">Agent</span></h1>
+        <p class="agent-welcome__sub">${ar ? "كلّفه بمهمة كبيرة — يخطّط، ينفّذ خطوة خطوة، يراجع نفسه، ويسلّمك النتيجة كاملة." : "Give it a big task — it plans, executes step by step, reviews itself, and delivers."}</p>
+        <div class="agent-welcome__starters">${starters.map((s) => `<button type="button" class="agent-starter">${escapeHtml(s)}</button>`).join("")}</div>
+      </div>`;
+    w.querySelectorAll(".agent-starter").forEach((b) => b.addEventListener("click", () => { els.input.value = b.textContent; autoGrow(); updateSendState(); els.input.focus(); }));
+    injectBrandMarks(w);
+    return;
+  }
   // Minimal welcome: wordmark + time-of-day greeting. Nothing instructional.
   w.innerHTML = `
     <div class="welcome">
@@ -2495,6 +3189,59 @@ function openImageLightbox(src) {
   document.body.appendChild(ov);
 }
 
+/* A small right-click / long-press context menu with a Copy action — works on every
+   device (desktop contextmenu + touch long-press). Used on the user's own messages. */
+function closeMsgMenu() {
+  const m = document.getElementById("firasMsgMenu"); if (m) m.remove();
+  document.removeEventListener("pointerdown", msgMenuDocDown, true);
+  document.removeEventListener("keydown", msgMenuKey);
+  window.removeEventListener("resize", closeMsgMenu);
+  const sc = document.getElementById("chatScroll"); if (sc) sc.removeEventListener("scroll", closeMsgMenu);
+}
+function msgMenuDocDown(e) { const m = document.getElementById("firasMsgMenu"); if (m && !m.contains(e.target)) closeMsgMenu(); }
+function msgMenuKey(e) { if (e.key === "Escape") closeMsgMenu(); }
+function openMsgMenu(x, y, text) {
+  closeMsgMenu();
+  const ar = state.lang === "ar";
+  const menu = document.createElement("div");
+  menu.id = "firasMsgMenu"; menu.className = "msg-menu";
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "msg-menu__item";
+  btn.innerHTML = ICONS.copy + "<span>" + ((t() && t().copy) || (ar ? "نسخ" : "Copy")) + "</span>";
+  btn.addEventListener("click", async () => {
+    const ok = await copyText(String(text || ""));
+    showToast(ok ? ((t() && t().copied) || (ar ? "تم النسخ" : "Copied")) : ((t() && t().copyFailed) || (ar ? "فشل النسخ" : "Copy failed")));
+    closeMsgMenu();
+  });
+  menu.appendChild(btn);
+  menu.style.visibility = "hidden";
+  document.body.appendChild(menu);
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - mw - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - mh - 8)) + "px";
+  menu.style.visibility = "";
+  setTimeout(() => {
+    document.addEventListener("pointerdown", msgMenuDocDown, true);
+    document.addEventListener("keydown", msgMenuKey);
+    window.addEventListener("resize", closeMsgMenu);
+    const sc = document.getElementById("chatScroll"); if (sc) sc.addEventListener("scroll", closeMsgMenu);
+  }, 0);
+}
+/* Wire right-click + touch long-press on an element to open the copy menu. */
+function attachCopyMenu(el, getText) {
+  el.addEventListener("contextmenu", (e) => { e.preventDefault(); openMsgMenu(e.clientX, e.clientY, getText()); });
+  let lpTimer = null, lpAt = null;
+  el.addEventListener("pointerdown", (e) => {
+    if (e.pointerType !== "touch") return;
+    lpAt = { x: e.clientX, y: e.clientY };
+    lpTimer = setTimeout(() => { lpTimer = null; openMsgMenu(lpAt.x, lpAt.y, getText()); }, 480);
+  });
+  const cancel = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } };
+  el.addEventListener("pointermove", (e) => { if (lpAt && Math.hypot(e.clientX - lpAt.x, e.clientY - lpAt.y) > 10) cancel(); });
+  el.addEventListener("pointerup", cancel);
+  el.addEventListener("pointercancel", cancel);
+}
+
 function userTurnEl(msg) {
   const turn = document.createElement("div");
   turn.className = "turn msg-user";
@@ -2552,8 +3299,10 @@ function userTurnEl(msg) {
     txt.style.whiteSpace = "pre-wrap";
     txt.textContent = msg.content;
     bubble.appendChild(txt);
+    typesetMath(txt);   // render the user's own $…$ / \(…\) / $$…$$ / \[…\] as beautiful math (like AI replies)
   }
   turn.appendChild(bubble);
+  if (msg.content) attachCopyMenu(bubble, () => msg.content || "");  // right-click / long-press → Copy
   return turn;
 }
 
@@ -2586,9 +3335,15 @@ function aiTurnEl(msg, index) {
   const md = document.createElement("div");
   md.className = "md";
   const imgMeta = parseImageMeta(msg.content);
-  const codeMeta = !imgMeta ? parseCodeMeta(msg.content) : null;
-  const fileFmt = !imgMeta && !codeMeta && msg.content && msg.content.trim() ? isFileStreamReply(msg, activeChat()) : null;
-  if (imgMeta) {
+  const agentMeta = !imgMeta ? parseAgentMeta(msg.content) : null;
+  const projMeta = !imgMeta && !agentMeta ? parseProjectMeta(msg.content) : null;
+  const codeMeta = !imgMeta && !agentMeta && !projMeta ? parseCodeMeta(msg.content) : null;
+  const fileFmt = !imgMeta && !agentMeta && !projMeta && !codeMeta && msg.content && msg.content.trim() ? isFileStreamReply(msg, activeChat()) : null;
+  if (agentMeta) {
+    md.appendChild(buildAgentCard(agentMeta, lang)); // Firas Agent run (live plan card, survives reload)
+  } else if (projMeta) {
+    md.appendChild(buildProjectCard(projMeta, lang)); // multi-file folder (viewer + ZIP download)
+  } else if (imgMeta) {
     md.appendChild(buildImageCard(imgMeta, lang)); // generated image (re-loads on reload)
   } else if (codeMeta) {
     md.appendChild(buildCodeCard(codeMeta, lang)); // code deliverable (copy/download/preview)
@@ -3361,6 +4116,23 @@ function exportCss(th, isAr, scope) {
     dp + "tr,td,th{break-inside:avoid;page-break-inside:avoid}" +
     dp + "li,.katex-display,blockquote,pre,figure{break-inside:avoid}" +
     dp + "img{max-width:100%;page-break-inside:avoid;break-inside:avoid;border-radius:6px}" +
+    dp + ".tikz-figure{margin:1.1em 0;text-align:center;page-break-inside:avoid;break-inside:avoid}" +
+    dp + ".tikz-figure svg{max-width:100%;height:auto}" +
+    dp + ".plot-figure{max-width:480px;margin-inline:auto}" +
+    dp + ".plot-figure{--plot-c1:#" + th.accent + ";--plot-c2:#2563eb;--plot-c3:#dc2626;--plot-c4:#059669;--plot-c5:#7c3aed}" +
+    dp + ".plot-legend{background:#fff;border:1px solid #e5e7eb}" +
+    dp + ".plot-legend__lb{color:#374151}" +
+    dp + ".plot-figure .plot-bg{fill:#fff;stroke:#d1d5db}" +
+    dp + ".plot-figure .plot-grid{stroke:#e8e8e3;opacity:1}" +
+    dp + ".plot-figure .plot-axis{stroke:#374151}" +
+    dp + ".plot-figure .plot-arrow{fill:#374151}" +
+    dp + ".plot-figure .plot-tick{fill:#4b5563;font-size:9px}" +
+    dp + ".plot-figure .plot-axislabel{fill:#374151;font-size:10.5px;font-style:italic}" +
+    dp + ".plot-figure .plot-curve{fill:none}" +
+    dp + ".plot-figure .plot-legend-bg{fill:#fff;opacity:.9;stroke:#e5e7eb}" +
+    dp + ".plot-figure svg{width:auto;max-width:100%;height:auto;display:block;margin-inline:auto}" +   // definite size for print (override screen width:100%)
+    dp + ".plot-legend{direction:ltr}" +                                                                 // keep legend math LTR inside an RTL doc
+    dp + ".plot-legend__lb .katex{direction:ltr}" +
     dp + ".katex{font-size:1.05em}" +
     dp + ".katex-display{margin:1.15em 0;max-width:100%;overflow:visible;page-break-inside:avoid;direction:ltr;text-align:center}" +
     dp + ".katex{max-width:100%;direction:ltr}" +
@@ -3371,20 +4143,37 @@ function exportCss(th, isAr, scope) {
 /** Build the cover + body HTML (no <style>). Returns { cover, body, hasCover }. */
 function exportBody(mdNode, lang, meta) {
   const clone = mdNode.cloneNode(true);
-  clone.querySelectorAll(".code-block__head, .code-block__copy, .code-preview-btn, .file-disclosure__summary").forEach((n) => n.remove());
+  clone.querySelectorAll(".code-block__head, .code-block__copy, .code-preview-btn, .file-disclosure__summary, .tikz-figure__spin, .plot-reset, script[type='text/tikz']").forEach((n) => n.remove());
+  // Each plot/tikz SVG has internal clip-path/marker/gradient ids; the LIVE chat SVG keeps the
+  // SAME ids and stays (hidden) in the DOM during print, so url(#id) would resolve to the hidden
+  // def and clip the whole graph away → blank. Re-id every cloned SVG's ids to make them unique.
+  clone.querySelectorAll("svg").forEach((svg, i) => {
+    // Give print a DEFINITE intrinsic size: an inline SVG sized only by viewBox + CSS height:auto
+    // renders on screen but can COLLAPSE to zero height when actually printed → blank graph.
+    const vb = (svg.getAttribute("viewBox") || "").split(/[\s,]+/).filter((x) => x !== "");
+    if (vb.length === 4 && !svg.getAttribute("width")) { svg.setAttribute("width", vb[2]); svg.setAttribute("height", vb[3]); }
+    let html = svg.innerHTML;
+    if (html.indexOf('id="') === -1) return;
+    const pfx = "ex" + i + "_", ids = [];
+    html = html.replace(/\bid="([^"]+)"/g, (m, id) => { ids.push(id); return 'id="' + pfx + id + '"'; });
+    ids.forEach((id) => {
+      const esc = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      html = html.replace(new RegExp("url\\(#" + esc + "\\)", "g"), "url(#" + pfx + id + ")");
+      html = html.replace(new RegExp('((?:xlink:)?href=")#' + esc + '"', "g"), "$1#" + pfx + id + '"');
+    });
+    svg.innerHTML = html;
+  });
   const body = clone.innerHTML;
   const title = escapeHtml(meta.title || (activeChat() && activeChat().title) || "");
   const subtitle = escapeHtml(meta.subtitle || "");
   const dateStr = escapeHtml(meta.date || todayStr(lang));
   const cover = title ? (
     "<section class='cover'><div class='cover__pad'>" +
-      "<div class='cover__brand'>Firas&nbsp;AI</div>" +
       "<div class='cover__mid'>" +
         "<h1 class='cover__title'>" + title + "</h1>" +
         (subtitle ? "<p class='cover__sub'>" + subtitle + "</p>" : "") +
         "<div class='cover__rule'></div>" +
       "</div>" +
-      "<div class='cover__date'>" + dateStr + "</div>" +
     "</div></section>"
   ) : "";
   return { cover, body, hasCover: !!title };
@@ -3519,59 +4308,86 @@ async function exportPdf(turn, lang, msg) {
   const { meta } = parseFileMeta(msg && msg.content);
   const mdNode = mdNodeForTurn(turn);
   if (!mdNode || !mdNode.textContent.trim()) { showToast(t().exportEmpty); return; }
-  const isAr = lang === "ar";
+  // Direction follows the CONTENT, not the UI language — an ENGLISH exam must render LTR even when the
+  // user's language is Arabic, otherwise the LTR text overflows and gets CUT on the RTL side.
+  const _dt = mdNode.textContent || "";
+  const isAr = ((_dt.match(/[؀-ۿ]/g) || []).length) > ((_dt.match(/[A-Za-z]/g) || []).length);
   ensureFileTitle(meta, mdNode);
   const th = themeFor(meta);
+  // Save-as filename = the request/title (Chrome uses document.title as the default PDF name).
+  const prevDocTitle = document.title;
+  const fileTitle = String(meta.filename || meta.title || (activeChat() && activeChat().title) || "Firas AI")
+    .replace(/\$+/g, "").replace(/\\[a-zA-Z]+/g, "").replace(/[{}\\^_]/g, "")
+    .replace(/[\\/:*?"<>|\n\r]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 90) || "Firas AI";
+  document.title = fileTitle;
+  if (mdNode.querySelector(".tikz-figure[data-tikz-pending]")) showToast(isAr ? "يُحضّر الرسوم قبل الحفظ…" : "Rendering figures…");
+  await tikzReady(30000);                       // wait for TikZ figures to finish (the TeX engine can be slow to load)
   const { cover, body } = exportBody(mdNode, lang, meta);
 
-  // NATIVE print-to-PDF. We render the document into the LIVE page (so the app's KaTeX stylesheet
-  // and fonts apply → flawless math AND flawless Arabic shaping on EVERY browser, incl. Safari /
-  // iPad), then ask the browser to print it. The browser produces a real VECTOR PDF instantly —
-  // NO canvas rasterization, so there's no lag/freeze on phones, the text is real & selectable, the
-  // file is tiny, and it costs ZERO server/Netlify. The browser's own "Save as PDF" dialog asks
-  // where to save it on the device. The print sheet is the ONLY thing the user sees of this root.
-  const oldRoot = document.getElementById("firasPrintRoot"); if (oldRoot) oldRoot.remove();
-  const oldStyle = document.getElementById("firasPrintStyle"); if (oldStyle) oldStyle.remove();
-
-  const printRoot = document.createElement("div");
-  printRoot.id = "firasPrintRoot";
-  printRoot.setAttribute("dir", isAr ? "rtl" : "ltr");
-  printRoot.innerHTML = cover + "<div class='doc'>" + body + "</div>";
-  numberListsExplicitly(printRoot.querySelector(".doc"));
-
-  const style = document.createElement("style");
-  style.id = "firasPrintStyle";
-  style.textContent =
-    "#firasPrintRoot{display:none}" +                               // invisible on screen
-    "@media print{" +
-      "@page{size:A4;margin:15mm 14mm}" +
-      "html,body{background:#fff!important;margin:0!important;padding:0!important;height:auto!important;min-height:0!important;overflow:visible!important}" +
-      "body>*:not(#firasPrintRoot){display:none!important}" +       // print ONLY the document
-      "#firasPrintRoot{display:block!important;position:static!important;width:auto!important;max-width:none!important;height:auto!important;overflow:visible!important}" +
-      exportCss(th, isAr, "#firasPrintRoot") +                      // themed typography, cover, KaTeX
-    "}";
-  document.head.appendChild(style);
-  document.body.appendChild(printRoot);
+  // DIRECT DOWNLOAD (not print). Build an OFF-SCREEN, themed, A4-width root and render it to a REAL PDF
+  // file via html2pdf (html2canvas + jsPDF), then download it: on a COMPUTER it saves straight to the
+  // Downloads folder (no print dialog the user couldn't save from); on a PHONE it triggers the browser's
+  // native "download this file?" prompt → the file lands in Downloads. Per-page margins + page-break-avoid
+  // keep content off the edges and stop figures/rows being cut across pages. No URL / date / header /
+  // footer — it's a generated file, not a print.
+  const oldRoot = document.getElementById("firasExportRoot"); if (oldRoot) oldRoot.remove();
+  const root = document.createElement("div");
+  root.id = "firasExportRoot";
+  root.setAttribute("dir", isAr ? "rtl" : "ltr");
+  root.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff;z-index:-1";
+  root.innerHTML = "<style>" + exportCss(th, isAr, "#firasExportRoot") +
+    "#firasExportRoot{width:794px!important;overflow:visible!important;margin:0;padding:0}#firasExportRoot .cover{height:1150px}</style>" +
+    cover + "<div class='doc'>" + body + "</div>";
+  numberListsExplicitly(root.querySelector(".doc"));
+  const titleEl = root.querySelector(".cover__title");
+  if (titleEl) { titleEl.textContent = mathifyTitle(titleEl.textContent); typesetMath(titleEl); }
+  document.body.appendChild(root);
 
   showToast(t().preparing);
-  await ensureExportFonts(isAr);                  // professional fonts ready before printing
-  await new Promise((r) => setTimeout(r, 120));   // let fonts + layout settle
+  await ensureExportFonts(isAr);                  // professional fonts ready first
+  await tikzReady(30000);                         // let TikZ/plot figures finish rendering
+  await new Promise((r) => setTimeout(r, 160));   // fonts + layout settle
 
   let done = false;
-  const cleanup = () => {
-    if (done) return; done = true;
-    try { printRoot.remove(); } catch (_) {}
-    try { style.remove(); } catch (_) {}
-    window.removeEventListener("afterprint", cleanup);
-  };
-  window.addEventListener("afterprint", cleanup);
-  setTimeout(cleanup, 120000);                    // safety net if afterprint never fires (mobile)
-
+  const cleanup = () => { if (done) return; done = true; try { root.remove(); } catch (_) {} try { document.title = prevDocTitle; } catch (_) {} };
   try {
-    window.print();                               // browser renders the vector PDF + save dialog
+    await loadScripts(EXPORT_LIBS.pdf);           // html2canvas@1.4.1 + jsPDF@2.5.1 (the html2pdf bundle produced blank PDFs)
+    const H2C = window.html2canvas, JSPDF = window.jspdf && window.jspdf.jsPDF;
+    if (typeof H2C !== "function" || typeof JSPDF !== "function") throw new Error("pdf libs unavailable");
+    const canvas = await H2C(root, { scale: 2, useCORS: true, backgroundColor: "#ffffff", logging: false, windowWidth: 820 });
+    if (!canvas || !canvas.width || !canvas.height) throw new Error("blank capture");
+    const pdf = new JSPDF("p", "mm", "a4");
+    const pageW = 210, pageH = 297, margin = 12, contentWmm = pageW - 2 * margin;
+    const pxPerMm = canvas.width / contentWmm;                   // canvas px per mm
+    const pageContentPx = (pageH - 2 * margin) * pxPerMm;        // usable page height, in canvas px
+    // Safe break points = BOTTOM of block elements, so a page never cuts through a line / figure / row.
+    const rr = root.getBoundingClientRect(), sc = canvas.height / rr.height;
+    const breaks = [0];
+    root.querySelectorAll("p,li,h1,h2,h3,h4,figure,tr,blockquote,pre,.katex-display,.tikz-figure,.plot-figure,table,.cover,hr").forEach((el) => {
+      const y = (el.getBoundingClientRect().bottom - rr.top) * sc;
+      if (y > 1 && y < canvas.height) breaks.push(y);
+    });
+    breaks.push(canvas.height); breaks.sort((a, b) => a - b);
+    let srcY = 0, firstPage = true;
+    while (srcY < canvas.height - 2) {
+      const limit = srcY + pageContentPx;
+      let cut = 0;
+      for (const bp of breaks) { if (bp > srcY + 24 && bp <= limit + 0.5) cut = bp; }
+      if (!cut) cut = Math.min(limit, canvas.height);            // an element taller than a page → forced cut
+      cut = Math.min(cut, canvas.height);
+      const sliceH = Math.max(1, Math.round(cut - srcY));
+      const slice = document.createElement("canvas"); slice.width = canvas.width; slice.height = sliceH;
+      slice.getContext("2d").drawImage(canvas, 0, srcY, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+      if (!firstPage) pdf.addPage();
+      pdf.addImage(slice.toDataURL("image/jpeg", 0.95), "JPEG", margin, margin, contentWmm, sliceH / pxPerMm);
+      firstPage = false; srcY = cut;
+    }
+    pdf.save(fileTitle + ".pdf");
+    cleanup();
+    showToast(isAr ? "تم تنزيل الملف ✓" : "File downloaded ✓");
   } catch (_) {
     cleanup();
-    showToast(t().formatUnavailable);
+    showToast(t().formatUnavailable || (isAr ? "تعذّر إنشاء الملف" : "Couldn't create the file"));
   }
 }
 
@@ -4003,7 +4819,12 @@ function closeHtmlPreview() {
 ---------------------------------------------------------------------------- */
 let autoScroll = true;
 function scrollToBottom() {
-  els.chatScroll.scrollTop = els.chatScroll.scrollHeight;
+  // Instant, not smooth: per-frame smooth-scroll assignments during streaming restart the
+  // animation forever (view chases the bottom, wastes main thread). A rAF settle pass corrects
+  // once content-visibility sizes resolve on long threads.
+  const el = els.chatScroll;
+  el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
+  requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
 }
 function onScroll() {
   const el = els.chatScroll;
@@ -4016,7 +4837,7 @@ function onScroll() {
    Image attachments — client-side downscale, tray, never-freeze reads
    pendingImages: [{ id, full: {b64,mime}, thumb: dataURL }]
 ---------------------------------------------------------------------------- */
-const MAX_IMAGES = 4;
+const MAX_IMAGES = 10;
 const MAX_EDGE = 1568;       // longest edge sent to the vision model
 const THUMB_EDGE = 256;      // tiny thumb persisted to history
 let pendingImages = [];
@@ -4070,18 +4891,46 @@ async function extractPdfText(file) {
   return text.trim();
 }
 /** Higher-capacity PDF extraction for the admin reference library (whole books). */
-async function extractPdfTextForKb(file) {
+async function extractPdfTextForKb(file, onProgress) {
   const pdfjs = await loadPdfJs();
   const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
   let text = "";
-  const pages = Math.min(pdf.numPages, 400);
+  // NO page cap — any-size books are supported (the uploader splits the text into parts).
+  // A high RAM safety net only; per-page cleanup + periodic yields keep the tab responsive.
+  const pages = pdf.numPages;
   for (let i = 1; i <= pages; i++) {
     const page = await pdf.getPage(i);
     const tc = await page.getTextContent();
     text += tc.items.map((it) => it.str).join(" ") + "\n\n";
-    if (text.length > 1500000) break;   // ~1.5M chars cap per book
+    try { page.cleanup(); } catch (_) {}
+    if (onProgress && (i % 5 === 0 || i === pages)) onProgress(i, pages);
+    if (i % 25 === 0) await new Promise((r) => setTimeout(r, 0));   // let the UI breathe
+    if (text.length > 40_000_000) break;   // extreme RAM safety net only
   }
   return text.trim();
+}
+
+/* Split a big book's text into ≤~700K-char parts on paragraph (then sentence) boundaries.
+   Each part is uploaded as its OWN KB entry — this is what makes ANY-size PDFs work: every
+   part stays under the backend's per-entry chunk cap AND under the edge request-body limit.
+   Search needs no changes: both backends score per-chunk across all entries, so parts merge. */
+function splitKbText(text, maxLen) {
+  maxLen = maxLen || 700_000;
+  const s = String(text);
+  if (s.length <= maxLen) return [s];
+  const parts = [];
+  let start = 0;
+  while (start < s.length) {
+    let end = Math.min(start + maxLen, s.length);
+    if (end < s.length) {
+      const para = s.lastIndexOf("\n\n", end);
+      if (para > start + maxLen * 0.5) end = para;
+      else { const sent = Math.max(s.lastIndexOf(". ", end), s.lastIndexOf("۔", end), s.lastIndexOf("؟", end), s.lastIndexOf("? ", end), s.lastIndexOf("! ", end), s.lastIndexOf("\n", end)); if (sent > start + maxLen * 0.5) end = sent + 1; }
+    }
+    parts.push(s.slice(start, end).trim());
+    start = end;
+  }
+  return parts.filter((p) => p);
 }
 
 /** Load a File into an HTMLImageElement (off the main render path). */
@@ -4367,9 +5216,27 @@ function buildMessages(tier, conversation, replyLang) {
       : tier === "ultra"
       ? " DIFFICULTY TIER — you are ULTRA: when generating a problem, make it VERY HARD (advanced competition), but DELIBERATELY one notch EASIER than the Max tier so the difference is clear — still completely valid and error-free."
       : "";
+  const imageRule =
+    " When MULTIPLE images are attached, examine EVERY image carefully and INDIVIDUALLY (one by one), " +
+    "and use ALL of them to answer fully — never skip, merge, or ignore any attached image.";
+  const tikzRule =
+    " GRAPHING A FUNCTION (INSTANT — PREFERRED): for a function graph / رسم بياني للدالة (y = f(x)), output a " +
+    "fenced code block tagged `plot` — it renders INSTANTLY as a real graph (zero delay, no engine). Put one or " +
+    "more `y = <expression>` lines using EXPLICIT operators and standard functions, e.g.\n```plot\ny = x^2\n" +
+    "domain: -4..4\n```\nSupported: + - * / ^, parentheses, and sin cos tan asin acos atan sinh cosh tanh exp ln " +
+    "log(base10) sqrt cbrt abs floor ceil round; constants pi, e. Use ONLY x as the variable; write explicit " +
+    "operators (x^2, 2*x, 1/(1+x^2), exp(-x^2), sin(x)). Several `y = …` lines draw several curves together. Add " +
+    "an optional `domain: a..b` line. " +
+    "OTHER DRAWINGS (geometry / diagrams — triangles, circles, vectors, number lines, shapes, NOT function graphs): " +
+    "output a fenced `tikz` block with a COMPLETE, self-contained \\begin{tikzpicture} … \\end{tikzpicture} — PLAIN " +
+    "TikZ only (NO \\documentclass / \\usepackage / pgfplots / external libraries; draw axes and labels manually " +
+    "with \\draw and \\node). " +
+    "A request to DRAW / sketch / graph is answered with a `plot` or `tikz` figure in a NORMAL chat reply — NEVER " +
+    "by building an HTML/CSS/JS page, a <canvas>, or a website to draw it (build a web app ONLY if the user " +
+    "EXPLICITLY asks for an interactive web app). Normal math still goes in $ … $ / $$ … $$ as usual.";
   const system = {
     role: "system",
-    content: model.persona + identityRule + langRule + mathRule + accuracyRule + codeRule + genLevelRule + (planning ? "" : buildRule + engineerRule),
+    content: model.persona + identityRule + langRule + mathRule + accuracyRule + codeRule + genLevelRule + imageRule + tikzRule + (planning ? "" : buildRule + engineerRule),
   };
 
   // PLAN MODE: a per-turn system message (inserted right after the persona).
@@ -4455,7 +5322,8 @@ function fileGuidance(fmt) {
     "It MUST be exactly this fenced form with valid JSON (no comments, no trailing commas):\n" +
     "```firas-file\n" +
     '{"filename": "SHORT MEANINGFUL NAME in the user’s language, NO file extension", ' +
-    '"title": "the document/deck title", "subtitle": "one short line or empty", "theme": "<one theme key>"}\n' +
+    '"title": "a SHORT clean human title (max ~8 words); if it needs a formula, write it ONCE as proper LaTeX inside $ … $ so it renders as pretty math — never paste raw code/backslashes, never repeat the formula", ' +
+    '"subtitle": "one short line or empty", "theme": "<one theme key>"}\n' +
     "```\n" +
     "YOU choose the filename — specific and professional, derived from the request " +
     "(e.g. “20 معادلة تكامل”, not “document”). " + themes;
@@ -4527,8 +5395,9 @@ function plannerSys(fmt, lang) {
     "THINK like a professional first: who is the reader, what is the document's purpose, and what structure + visual " +
     "hierarchy would make it look polished, credible and authoritative. Then decide the file's identity and a COMPLETE, " +
     "well-ordered structure — do NOT write the full content yet. Output FIRST this exact block (valid JSON):\n" +
-    "```firas-file\n{\"filename\":\"short meaningful name in the user's language, no extension\",\"title\":\"a strong, " +
-    "specific title\",\"subtitle\":\"one concise line or empty\",\"theme\":\"<one theme key>\"}\n```\nthen a blank line, " +
+    "```firas-file\n{\"filename\":\"short meaningful name in the user's language, no extension\",\"title\":\"a SHORT " +
+    "clean title (max ~8 words); a formula goes ONCE as $ … $ LaTeX, never raw code/backslashes, never repeated\"," +
+    "\"subtitle\":\"one concise line or empty\",\"theme\":\"<one theme key>\"}\n```\nthen a blank line, " +
     "then a concise OUTLINE (bullet list) of the sections/items in order — a professional flow (clear opening/intro, " +
     "logically grouped main sections with descriptive headings, supporting tables/lists where useful, and a closing/" +
     "summary). If the user asked for N items (e.g. N equations), plan exactly N. Pick a theme whose tone fits the topic." +
@@ -4536,11 +5405,42 @@ function plannerSys(fmt, lang) {
 }
 function authorSys(fmt, lang) {
   const mathRule = " Render ALL mathematics with real LaTeX inside $ … $ (inline) or $$ … $$ (display) so it typesets " +
-    "beautifully (like KaTeX) — use proper notation: \\frac, \\sqrt, ^{}, _{}, \\int, \\sum, \\prod, \\lim, Greek letters, " +
+    "beautifully (like KaTeX). ZERO ERRORS: every LaTeX expression MUST be VALID, BALANCED and render-perfect (NEVER a " +
+    "red error) — balance every { } and \\left…\\right, never use an undefined/custom macro, keep \\displaystyle OUT of " +
+    "inline $…$, escape % and & properly, and prefer a simpler valid form over a fancy one that might break. " +
+    "FILL-IN-THE-BLANK: write a blank as $\\underline{\\hspace{1.4cm}}$ — NEVER \\color / \\textcolor and NEVER bare " +
+    "underscores (_ _ _) inside math or \\text{} (they break rendering). Use proper " +
+    "notation: \\frac, \\sqrt, ^{}, _{}, \\int, \\sum, \\prod, \\lim, Greek letters, " +
     "vectors/matrices via \\begin{matrix}…\\end{matrix} or \\begin{bmatrix}…, multi-line derivations via " +
     "\\begin{aligned}…\\end{aligned}, and piecewise via \\begin{cases}…\\end{cases}. Present each result cleanly and " +
-    "professionally, define symbols, and show key steps. NEVER put math in a code block, NEVER use \\documentclass or " +
+    "professionally, define symbols, and show key steps. LAYOUT — keep SHORT math (a number with units, a single " +
+    "symbol, a short formula, or a variable) INLINE with $ … $ WITHIN the sentence; do NOT break short expressions onto " +
+    "their own line, and use DISPLAY $$ … $$ ONLY for a standalone, important, multi-part equation. Never leave a lone " +
+    "period or bare punctuation on its own line after an equation. NEVER put math in a code block, NEVER use \\documentclass or " +
     "\\begin{document}, and NEVER tell the user to compile or use Overleaf.";
+  const tikzDocRule = (fmt === "pdf")
+    ? " FIGURES / GRAPHS — YOU MUST INCLUDE THE ACTUAL FIGURE (never just describe 'the figure above'): " +
+      "For a FUNCTION GRAPH, output a fenced ```plot block — one or more `y = <expression>` lines (EXPLICIT operators + " +
+      "standard functions: x^2, 2*x, sin(x), exp(-x^2), sqrt(x), arctan(x), 1/(1+x^2); constant pi) plus an optional " +
+      "`domain: a..b` line; it renders INSTANTLY as a real graph in the document. For a GEOMETRIC figure (triangle, circle, " +
+      "vectors, number line…), output a fenced ```tikz block with a COMPLETE \\begin{tikzpicture} … \\end{tikzpicture}. " +
+      "CRITICAL — a LIGHTWEIGHT in-browser TeX engine renders it, so keep it SIMPLE and MINIMAL or it FAILS and shows as raw " +
+      "code: use ONLY basic \\draw / \\node / \\foreach / \\coordinate with plain options (thick, ->, red, dashed, circle, " +
+      "rectangle); NO \\usepackage, NO pgfplots, NO tikz libraries (arrows.meta, positioning, calc…), NO \\text{} (use " +
+      "\\mathrm{} instead), NO \\begin{scope}; place EVERY point and node with EXPLICIT (x,y) coordinates — NOT relative " +
+      "positioning (right=1cm of X) or node anchors (X.east); few elements, small coordinates. NEVER draw an EMPTY frame/box " +
+      "as a figure placeholder — every figure MUST contain its actual elements (the wires, currents, arrows, field symbols, " +
+      "labels…); if you cannot draw the real elements, OMIT the figure and describe it in one sentence instead. " +
+      "EXAMPLE of a CORRECT complete figure (two parallel current-carrying wires):\n```tikz\n\\begin{tikzpicture}[scale=1]\n" +
+      "\\draw[thick] (0,2) -- (6,2) node[right] {wire 1};\n\\draw[thick] (0,0) -- (6,0) node[right] {wire 2};\n" +
+      "\\draw[->,red,thick] (2.6,2) -- (3.8,2) node[above] {$I_1$};\n\\draw[->,red,thick] (2.6,0) -- (3.8,0) node[below] {$I_2$};\n" +
+      "\\draw[<->,blue] (1,0) -- (1,2) node[midway,left] {$d$};\n\\end{tikzpicture}\n```\n— note it has ALL the elements " +
+      "(wires, current arrows, separation), not an empty frame. For an electric CIRCUIT you MAY " +
+      "use circuitikz components between EXPLICIT coordinates — \\draw (x1,y1) to[R=$R$] (x2,y2), and to[L=$L$] / to[C=$C$] / " +
+      "to[battery=$V$] / to[short], plus node[ground]{} — laid out on a simple rectangle. Put the figure BEFORE any text that refers " +
+      "to it. These `plot` / `tikz` blocks are DRAWINGS and are the ONLY code blocks allowed — never output any other code, " +
+      "HTML or script."
+    : "";
   if (fmt === "xlsx" || fmt === "csv") return "You are an expert data author. Following the plan, output the data as clean " +
     "GitHub-style Markdown tables, each preceded by a '## Table Name' heading; plain numbers in numeric cells. Only the " +
     "content — no metadata block, no preamble, no code." + agentBrand(lang);
@@ -4553,17 +5453,22 @@ function authorSys(fmt, lang) {
     "bulleted/numbered lists where they aid clarity, GitHub-style Markdown tables for any structured data, and blockquotes " +
     "for key takeaways. Keep a confident professional tone with smooth flow between sections, and finish with a concise " +
     "conclusion/summary when appropriate. Be complete and correct: if N items were requested, produce exactly N, each " +
-    "properly explained." + mathRule + " Output ONLY the document body — no metadata block, no preamble, no commentary." + agentBrand(lang);
+    "properly explained. ORGANIZATION — make it VERY tidy and easy to scan: a consistent heading hierarchy, related content " +
+    "grouped together, uniform spacing (NO orphan lines, NO stray punctuation on its own line), and — for an exam/worksheet — " +
+    "clean question numbering with its parts (A/B/C…) and marks, each figure placed right beside the item it belongs to." + mathRule + tikzDocRule + " Output ONLY the document body — no metadata block, no preamble, no commentary." + agentBrand(lang);
 }
 function finisherSys(fmt, lang) {
   return "You are the finishing editor. You are given a metadata block and a draft. Output the FINAL " + fmt.toUpperCase() +
     " file: the metadata block EXACTLY as given (first), a blank line, then the COMPLETE, polished content. Keep ALL " +
     "content — never drop or summarize sections. Fix any problems: remove any preamble/greeting/commentary, convert any " +
-    "LaTeX-document or code-block math into inline $$ … $$ rendered math, ensure a strong '# Title' matching the " +
+    "LaTeX-document or code-block math into proper KaTeX math — keep SHORT expressions (a symbol, a number with units) " +
+    "INLINE with $ … $ inside the sentence (do NOT drop them onto their own line), and use DISPLAY $$ … $$ ONLY for a " +
+    "standalone important equation; ensure a strong '# Title' matching the " +
     "metadata, with consistent professional formatting and logical order. " +
     "IMPORTANT: if the draft is actually a PROGRAM/SCRIPT/code or a 'how-to' tutorial (e.g. Python, python-docx, " +
     "pip install, HTML) instead of a real document, EXTRACT the actual content from it (the equations, data, text, " +
     "titles) and rewrite it as a proper Markdown document — discard ALL code, commands, install/run steps and instructions. " +
+    "EXCEPTION: a ```plot or ```tikz fenced block is a DRAWING/GRAPH that renders as a real figure — KEEP it EXACTLY intact, never convert, describe, or remove it. " +
     "Output nothing but the final file." + agentBrand(lang);
 }
 function metaBlockString(meta) {
@@ -4927,6 +5832,23 @@ async function extractImageSource(images, userText, lang, signal, onStage) {
   } catch (_) { return ""; }
 }
 
+/* For a "make a NEW / HARDER version" request: extract ONLY a STRUCTURAL BLUEPRINT (topics, types,
+   sub-parts, marks, figures, constraints) — NOT the verbatim questions — so the generator MUST author
+   brand-new questions and literally cannot copy the originals (it never sees them). */
+async function extractImageStructure(images, userText, lang, signal, onStage) {
+  if (!Array.isArray(images) || !images.length) return "";
+  if (onStage) onStage("extract");
+  const ar = lang === "ar";
+  const sys = ar
+    ? "أنت محلّل امتحانات. **ممنوع منعًا باتًّا نسخ نص أي سؤال أو أرقامه أو قيمه.** أخرِج مخطّطًا هيكليًّا فقط: لكل سؤال وجزء اذكر رقمه/رمزه، ونوعه (صح/خطأ، اختيار من متعدد، حساب قصير، مسألة طويلة، إثبات، ملء فراغ)، والموضوع/المفهوم الذي يختبره (مثل: «القدرة في التوالي والتوازي»، «التأريخ بالكربون-14»، «القوة بين سلكين متوازيين»)، والدرجات، وهل يحتوي شكلًا وماذا يُظهر، وأي قيد (مثل «أجب عن خمسة فقط»). أخرِج قائمة مرتّبة موجزة من الأول إلى الأخير، بلا أي نص سؤال."
+    : "You are an exam analyzer. NEVER copy any question's text, numbers or values. Output a STRUCTURAL BLUEPRINT ONLY: for each question and sub-part give its number/label, TYPE (true-false / multiple-choice / short calculation / long problem / proof / fill-in-the-blank), the TOPIC/concept it tests (e.g. 'power in series vs parallel', 'carbon-14 dating', 'force between two parallel wires'), the marks, whether it has a figure and what it shows, and any constraint (e.g. 'answer five only'). Output a compact ordered list, first to last, with NO question text.";
+  const usr = (ar ? "حلّل الصورة/الصور وأخرِج المخطّط الهيكلي فقط (بدون نص الأسئلة): " : "Analyze the image(s); output the structural blueprint only (no question text): ") + String(userText || "").slice(0, 200) + ".";
+  try {
+    const out = await callAgentText([{ role: "system", content: sys }, { role: "user", content: usr, images }], "pro", signal);
+    return (out && out.trim()) ? out.trim() : "";
+  } catch (_) { return ""; }
+}
+
 /* Does an image turn want NEW/derived content generated (make similar/harder questions, solve,
    rewrite, summarize, build an exam…) vs just reading the image (extract/transcribe/what is this)?
    Generation must go 2-stage: vision extracts, then the STRONG text model writes the full output —
@@ -4938,22 +5860,97 @@ function isImageTransformRequest(s) {
   return genAr.test(t) || genEn.test(t);
 }
 
+/* The document author over-uses DISPLAY math ($$…$$) even for tiny expressions (a symbol, a number
+   with units), which drops each onto its own line with big gaps and shreds the surrounding sentence.
+   Convert those SHORT, simple display blocks back to INLINE $…$; keep real standalone / multi-line /
+   aligned equations as display. */
+/* Fill-in-the-blank LaTeX the model tends to emit — \color{red}{\text{____}} etc. — is INVALID KaTeX
+   (bare _ inside \text throws) and renders as raw red code. Convert every such pattern to a clean
+   \underline{\hspace{…}} blank; also strip stray \color/\textcolor wrappers (KaTeX-unsupported usage). */
+function fixMathBlanks(md) {
+  let s = String(md);
+  s = s.replace(/\\(?:text)?color\{[^{}]*\}\s*\{\s*\\text\{\s*_{2,}\s*\}\s*\}/g, "\\underline{\\hspace{1.4cm}}");
+  s = s.replace(/\\(?:text)?color\{[^{}]*\}\s*\{?\\text\{\s*_{2,}\s*\}\}?/g, "\\underline{\\hspace{1.4cm}}");
+  s = s.replace(/\\text\{\s*_{2,}\s*\}/g, "\\underline{\\hspace{1.4cm}}");
+  // any leftover \color{x}{y} / \textcolor{x}{y} → keep only the content y (KaTeX-safe)
+  s = s.replace(/\\(?:text)?color\{[^{}]*\}\s*\{([^{}]*)\}/g, "$1");
+  return s;
+}
+
+/* The model sometimes writes LaTeX commands OUTSIDE math delimiters ("Name: \underline{\hspace{5cm}}",
+   "0.85 A\cdotpm²") — they reach the page as raw backslash text. Fix the TEXT segments only (math and
+   fenced code are left untouched): wrap bare \underline blanks in $…$, unicode-ize simple commands. */
+function sanitizeBareLatex(md) {
+  return String(md).split(/(```[\s\S]*?```|\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\))/).map((seg, i) => {
+    if (i % 2 === 1) return seg;                       // math / fenced code — untouched
+    let s = seg;
+    s = s.replace(/\\underline\{\\hspace\{([^{}]*)\}\}/g, (m, l) => "$\\underline{\\hspace{" + l + "}}$");
+    s = s.replace(/\\hspace\{([^{}]*)\}/g, " ");
+    s = s.replace(/\\cdots(?![a-zA-Z])/g, "⋯");
+    s = s.replace(/\\cdotp/g, "·");                    // \cdotp even when glued to a unit ("A\cdotpm²" → "A·m²")
+    s = s.replace(/\\cdot(?![a-zA-Z])/g, "·");
+    s = s.replace(/\\times(?![a-zA-Z])/g, "×");
+    s = s.replace(/\\(?:degree|textdegree)(?![a-zA-Z])/g, "°");
+    s = s.replace(/\\pm(?![a-zA-Z])/g, "±");
+    return s;
+  }).join("");
+}
+
+function tightenInlineMath(md) {
+  return String(md).replace(/\$\$\s*([\s\S]*?)\s*\$\$/g, (m, inner) => {
+    const x = inner.trim();
+    if (!x) return m;
+    if (/\\\\|\\begin|\\end|&|\\int|\\sum|\\prod|\\oint|\\iint|\\lim|\\cases|\\aligned|\\matrix/.test(x)) return m;
+    if (x.length > 48) return m;
+    return "$" + x + "$";
+  });
+}
+
 async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) {
   // Files ALWAYS use the general document model (gpt-oss = "pro"), never the coder
   // (Ultra = qwen3-coder) — a coding model turns "make a PDF" into an HTML website.
   tierKey = "pro";
   const lastUser = [...convo].reverse().find((m) => m.role === "user");
   let userText = lastUser ? lastUser.content : "";
+  // If the user attached a FILE (PDF/text), include its content as SOURCE material so the
+  // deliverable can be built from it ("summarize this into a Word doc", "make X from this file", etc.).
+  if (lastUser && lastUser.fileText) userText += "\n\n=== ATTACHED FILE CONTENT (source material — build the deliverable from this) ===\n" + lastUser.fileText;
   // If the user attached image(s), extract their FULL content first and append it as the
   // source material so e.g. "make a harder version of this exam" sees the whole exam.
   const srcImages = lastUser && Array.isArray(lastUser.images) ? lastUser.images : null;
   if (srcImages && srcImages.length) {
+    // "make a NEW / HARDER version" → extract ONLY a structural blueprint (no verbatim questions), so the
+    // model MUST author new questions and literally cannot copy the originals. Otherwise → verbatim source.
+    const _req = String((lastUser && lastUser.content) || "");
+    const _harder = /أصعب|اصعب|أقوى|اقوى|جديد|مشابه|مماثل|نفس\s*النمط|بنمط|نسخة|مختلف|harder|tougher|stronger|\bnew\b|similar|same\s*pattern|variant|different/i.test(_req);
+    if (_harder) {
+      const spec = await extractImageStructure(srcImages, userText, lang, signal, onStage);
+      if (spec) userText += (lang === "ar"
+        ? "\n\n[أنت **لا ترى الأسئلة الأصلية** — عندك مخطّطها الهيكلي فقط. اصنع امتحانًا **جديدًا كليًّا وأصعب** يطابق هذا الهيكل والمواضيع والعدد والأجزاء والدرجات، بأسئلةٍ **من تأليفك** (أرقام وسيناريوهات وقيم جديدة، مستوى تنافسي/متقدم قوي جدًا)، صحيحة ومضبوطة وقابلة للحل. ارسم **كل** شكل مذكور بالمخطّط كبلوك ```tikz أو ```plot. اكتب الرياضيات بـLaTeX صحيح ومتوازن بلا أخطاء.]\n\n=== المخطّط الهيكلي للمصدر (للمحاكاة — لا يحتوي نص الأسئلة الأصلية) ===\n"
+        : "\n\n[You do NOT see the original questions — only their structural blueprint. Create a COMPLETELY NEW, HARDER exam matching this structure, topics, count, sub-parts and marks, with questions YOU author (new numbers/scenarios/values, strong competition/advanced level), valid and solvable. Draw EVERY figure named in the blueprint as a ```tikz or ```plot block. Write valid, balanced, error-free LaTeX.]\n\n=== STRUCTURAL BLUEPRINT OF THE SOURCE (to mimic — it does NOT contain the original question text) ===\n") + spec;
+    } else {
     const extracted = await extractImageSource(srcImages, userText, lang, signal, onStage);
     if (extracted) {
       userText += (lang === "ar"
-        ? "\n\n[تعليمات صارمة: إن طُلبت نسخة «بنفس النمط» أو «مشابهة»: (1) ابقَ في **نفس مادة المصدر ومواضيعه** — لو المصدر رياضيات فالناتج رياضيات على نفس المواضيع، ويُمنع تحويله لفيزياء أو أي مادة أخرى أو اختراع امتحان مختلف. (2) طابِق بنية المصدر تمامًا — نفس عدد الأسئلة والترقيم والأجزاء (A/B/C) وتعليمات الاختيار («اختر ٤ فقط»…) والدرجات والعناوين والترتيب. (3) غيّر صعوبة المحتوى فقط، وأخرِج كل سؤالٍ وجزءٍ كاملًا دون نقص. اكتب الرياضيات بـ LaTeX صحيح.]\n\n=== المحتوى المُستخرَج بالكامل من الصورة/الصور المرفقة (المصدر) ===\n"
-        : "\n\n[Strict instructions: if a 'same pattern'/'similar' version is requested: (1) stay in the SOURCE'S SAME SUBJECT and topics — if the source is math, the output is math on the same topics; never switch it to physics or any other subject or invent a different exam. (2) Mirror the source structure exactly — same number of questions, numbering, sub-parts (A/B/C), selection instructions ('choose 4 only'…), marks, headings and order. (3) Change ONLY the difficulty, and output every question and part in full, dropping nothing. Write math in valid LaTeX.]\n\n=== FULL CONTENT EXTRACTED FROM THE ATTACHED IMAGE(S) (the source) ===\n") + extracted;
+        ? "\n\n[تعليمات صارمة — نسخة جديدة أصعب (وليست نسخًا): (1) اصنع أسئلة **جديدة تمامًا** — **يُمنع منعًا باتًّا** نسخ أو إعادة صياغة أسئلة المصدر؛ كل سؤال يجب أن يكون **مختلفًا وأصعب بوضوح** من نظيره في المصدر (أرقام/معطيات/سيناريو مختلفة، وخطوات أعمق ومستوى تنافسي/متقدم قوي جدًا) مع بقائه صحيحًا ومضبوطًا وقابلًا للحل. (2) ابقَ في **نفس مادة المصدر ومواضيعه** — لو فيزياء فالناتج فيزياء على نفس المواضيع؛ ممنوع تغيير المادة. (3) طابِق **بنية المصدر تمامًا**: نفس عدد الأسئلة والترقيم والأجزاء (A/B/C) وتعليمات الاختيار والدرجات والعناوين والترتيب. (4) ارسم **كل** شكل/رسم موجود بالمصدر (وأي شكل يحتاجه سؤال جديد) كبلوك ```tikz أو ```plot مرسوم فعليًا بجنب سؤاله — لا تتجاهل أي شكل ولا تكتفِ بوصفه. (5) اكتب الرياضيات بـ LaTeX صحيح وأخرِج كل سؤال وجزء كاملًا.]\n\n=== المحتوى المُستخرَج بالكامل من الصورة/الصور المرفقة (المصدر — للمحاكاة فقط، لا للنسخ) ===\n"
+        : "\n\n[Strict instructions — a NEW, HARDER version (NOT a copy): (1) GENERATE BRAND-NEW questions — NEVER copy or lightly reword the source; each must be DIFFERENT and clearly HARDER than its source counterpart (different numbers/data/scenario, deeper steps, strong competition/advanced level) while staying valid and fully solvable. (2) Stay in the SOURCE'S SAME SUBJECT and topics (physics→physics…); never switch subject. (3) Mirror the source STRUCTURE exactly: same number of questions, numbering, sub-parts (A/B/C), selection instructions, marks, headings and order. (4) Draw EVERY figure the source has (and any a new question needs) as an ACTUALLY-RENDERED ```tikz or ```plot block beside its question — never skip one or just describe it. (5) Write valid LaTeX; output every question and part in full.]\n\n=== FULL CONTENT EXTRACTED FROM THE ATTACHED IMAGE(S) (the source — to MIMIC, NOT to copy) ===\n") + extracted;
+      userText += (lang === "ar"
+        ? "\n\n=== نهاية المصدر ===\n[تذكير حاسم: المصدر أعلاه للمحاكاة فقط. اكتب امتحانًا جديدًا كليًّا وأصعب بنفس البنية والمادة والعدد لكن بلا أي سؤال منسوخ — غيّر جميع الأسئلة لا الأول فقط، وكل سؤال يختلف بأرقامه وسيناريوهاته ويكون أصعب؛ إن طابق أيٌّ منها سؤالَ المصدر فقد فشلت المهمة.]"
+        : "\n\n=== END OF SOURCE ===\n[FINAL REMINDER: the source is a REFERENCE ONLY — write a COMPLETELY NEW, HARDER exam with the SAME structure/subject/count but ZERO copied questions; change ALL questions (not just the first), each with different numbers/scenarios/values and clearly harder. If ANY of them matches a source question you have FAILED.]");
     }
+    }
+  }
+  // "سوّيها PDF" / "make it a PDF" / just "PDF" — a request that REFERS TO THE PREVIOUS ANSWER (e.g. a graph
+  // the user just got). Without the prior content the author has nothing to build from and HALLUCINATES a
+  // random document. Include the previous assistant answer as the source so the file is built from it.
+  const reqTxt = String((lastUser && lastUser.content) || "");
+  const prevAns = [...convo].reverse().find((m) => m.role === "assistant" && m.content && String(m.content).trim());
+  const strippedReq = reqTxt.replace(/pdf|بي\s*دي\s*اف|بدف|word|وورد|ورد|excel|اكسل|csv|pptx?|بوربوينت|powerpoint|ملف|مستند|وثيقة|file|document|deck|slides?|بصيغة|على\s*شكل|as|to|into|في|سوّ?ي|سوي|اعملي?|حوّ?ل|حول|خلّ?ي|خلي|اصنعي?|اعمل|make|create|turn|convert|export|لي|لنا/gi, " ").replace(/[\s،,.]+/g, "").trim();
+  const refersPrior = /سو[يّ]?ها|سوها|اعملها|اعمله|حوّ?لها|حوّ?له|خلّ?يها|خليها|نفسها|نفسه|هذا|هذه|هاي|هيا|فوق|السابق|الجواب|الرد|\bit\b|\bthis\b|\bthat\b|convert it|make it|turn it|turn this/i.test(reqTxt) || strippedReq.length < 4;
+  if (prevAns && refersPrior && !(lastUser && lastUser.fileText) && !(srcImages && srcImages.length)) {
+    const src = (typeof stripFileMetaBlock === "function" ? stripFileMetaBlock(prevAns.content) : prevAns.content);
+    userText += "\n\n=== CONTENT TO TURN INTO THE FILE — this is the PREVIOUS answer the user wants as a " + String(fmt).toUpperCase() +
+      " document. BUILD THE FILE FROM THIS EXACT CONTENT (keep its figures / graphs / ```plot / ```tikz / math intact, then organize and polish it into a professional document). Do NOT invent a different topic. ===\n" + src;
   }
   // BIG-COUNT branch: a request for many items ("1000 integrals/problems/questions…")
   // would truncate in a single author call → generate it in parallel BATCHES instead.
@@ -4976,7 +5973,12 @@ async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) 
     else if (!bigCount && /\b(?:many|lots?|several|tons?|full|long)\b|كثير|الكثير|طويل|عديد|مليئ|مليان/i.test(userText)) bigCount = 150;
     bigCount = Math.min(bigCount, 1000);
   }
-  if (bigCount >= 80 && fmt !== "xlsx" && fmt !== "csv" && fmt !== "pptx") {
+  // Only use the batched worksheet generator for a request to CREATE MANY FRESH math items (integrals/
+  // problems). NEVER for an image/file SOURCE (an uploaded exam is a STRUCTURED document on a specific
+  // subject — physics, chemistry… — that must be REPLICATED harder in the SAME subject, not turned into a
+  // pile of integrals). Those go to the normal author, which respects the source's subject and structure.
+  const hasSource = (srcImages && srcImages.length) || (lastUser && lastUser.fileText);
+  if (bigCount >= 80 && fmt !== "xlsx" && fmt !== "csv" && fmt !== "pptx" && !hasSource) {
     return await runBatchedFileDoc(userText, bigCount, fmt, lang, tierKey, signal, onStage);
   }
   // 1) Planner — identity + outline
@@ -5024,7 +6026,7 @@ async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) 
       finalDoc = metaBlock + "\n\n" + content.replace(/<[^>]+>/g, " ").replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     }
   }
-  return finalDoc;
+  return sanitizeBareLatex(fixMathBlanks(tightenInlineMath(finalDoc)));
 }
 
 /* ---- Large workbooks: generate N items in parallel BATCHES (no truncation) ---- */
@@ -5259,6 +6261,7 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
   // If the tab gets backgrounded (or starts hidden) during this stream, a resulting failure is
   // an INTERRUPTION (auto-resume), not a real error — track it so the catch can tell them apart.
   let sawHidden = document.hidden;
+  let retryBusy = false;   // set when the whole reply is an "engine busy" sentence → silent auto-retry
   const onVis = () => { if (document.hidden) sawHidden = true; };
   document.addEventListener("visibilitychange", onVis);
 
@@ -5291,6 +6294,8 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
   let thinkingNode = null;
   let pendingRender = false;
   let finalized = false; // once true, the final decorated DOM must not be clobbered
+  let lastPaintAt = 0;          // time floor: full markdown+KaTeX re-render ≤ ~7x/sec (O(n²) otherwise)
+  let lastRenderedAnswer = null; // skip the heavy body re-render when only "thinking" tokens arrived
 
   // Resolve the LIVE node for this streaming message in the current thread. When
   // the user is viewing this chat, re-find by index (the thread may have been
@@ -5313,6 +6318,12 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
     requestAnimationFrame(() => {
       pendingRender = false;
       if (finalized) return; // a trailing frame must not overwrite finalized output
+      // TIME FLOOR: re-parsing + re-typesetting the WHOLE accumulated answer every frame is
+      // O(n²) over the stream and chugs on long math-heavy replies. Cap the heavy pass at
+      // ~7-8/sec; re-arm a trailing timer so the final chunk always paints (and finalizeAi
+      // does an authoritative full render at the end regardless).
+      const now = performance.now();
+      if (now - lastPaintAt < 130) { setTimeout(scheduleRender, 140 - (now - lastPaintAt)); return; }
       const node = liveNode();
       if (!node) return; // navigated away — keep streaming headless
       aiNode = node;
@@ -5320,9 +6331,14 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
       if (!mdEl) return;
       if (codeReq) {
         // Code request → stream the source live into a code window.
+        lastPaintAt = now;
         renderLiveCodeInto(mdEl, answer, codeReq, replyLang);
         mdEl.classList.remove("stream-caret");
-      } else {
+      } else if (answer !== lastRenderedAnswer) {
+        // Only rebuild the body when the ANSWER text actually changed — a burst of
+        // "thinking" tokens alone must not re-parse/re-typeset the whole message.
+        lastPaintAt = now;
+        lastRenderedAnswer = answer;
         // File request → keep the raw document content out of the chat; show a calm
         // "Creating your file…" loader while it streams.
         mdEl.innerHTML = fileFmt ? buildFileLoadingHtml() : renderMarkdown(answer);
@@ -5614,6 +6630,19 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
     // "thinking" (reasoning). Fall back instead of persisting a blank Firas turn.
     if (!answer.trim()) throw new Error("empty stream");
 
+    // ENGINE-BUSY AUTO-RETRY: if the ENTIRE reply is one of the backend's engine-error sentences
+    // (all rescue engines momentarily failed), retry ONCE automatically after a short pause —
+    // the user should never have to press "try again" for a transient hiccup.
+    const busyRe = /^(The Firas AI (?:vision )?engine is (?:busy|unavailable|offline)[\s\S]{0,80}?|Something went wrong with the Firas AI engine\.) ?(Please )?[Tt]ry again\.?\s*(shortly\.?)?\s*$/;
+    if (busyRe.test(answer.trim()) && !aiMsg._busyRetry && !signal.aborted) {
+      aiMsg._busyRetry = true;
+      retryBusy = true;
+      finalized = true;
+      const node = liveNode(); const mdEl = node && node.querySelector(".msg-ai__body .md");
+      if (mdEl) mdEl.innerHTML = '<p style="opacity:.6">' + (replyLang === "ar" ? "يُعيد المحاولة تلقائيًا…" : "Retrying automatically…") + "</p>";
+      throw new Error("busy-retry");   // skip finalize; handled after cleanup
+    }
+
     // Finalize
     finalized = true;
     if (codeReq) {
@@ -5650,6 +6679,8 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
   } catch (err) {
     clearTimeout(timeoutId);
     finalized = true;
+    if (retryBusy) { /* transient engine-busy — retried below after cleanup; no error UI */ }
+    else {
     const aborted = signal.aborted && controller.reason !== "timeout";
     if (aborted) {
       const hasCode = codeReq && (answer || "").trim();
@@ -5692,10 +6723,18 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
       const liveNode = activeChat() === chat ? aiNode : null;
       if (liveNode && liveNode.isConnected) showInlineError(liveNode, convo, aiMsg);
     }
+    }
   } finally {
     document.removeEventListener("visibilitychange", onVis);
     activeStreams.delete(chatId);
     endStreaming(chatId);
+  }
+  // Transient "engine busy" — one silent retry after a short pause (cleanup above already ran,
+  // so the fresh streamAnswer call re-registers its own stream cleanly).
+  if (retryBusy) {
+    await new Promise((r) => setTimeout(r, 1800));
+    if (!chat.messages.includes(aiMsg)) return;   // user deleted/edited meanwhile
+    return streamAnswer(aiMsg, aiNode, chat, convoOverride);
   }
 }
 
@@ -5870,6 +6909,13 @@ async function sendMessage() {
     : (readyFiles.length ? readyFiles[0].name : (lang === "ar" ? "صورة" : "Image"));
   const chat = ensureActiveChat(text || attachLabel);
 
+  // SENDING here = full focus here: stop any stream still running in OTHER chats (e.g. code
+  // generation left behind after switching). Their partial output is kept (the abort path
+  // preserves what streamed); the engine then serves only the new conversation.
+  for (const [cid, s] of activeStreams) {
+    if (cid !== chat.id && s && s.controller) { try { s.controller.abort(); } catch (_) {} }
+  }
+
   // Push user message (images: full raw b64 for the live request only;
   // imageThumbs: small data-URLs kept for rendering + lean persistence).
   const userMsg = { role: "user", content: text, lang, tier: state.tier };
@@ -5916,6 +6962,8 @@ async function sendMessage() {
 /** Append an assistant placeholder for `chat` and stream into it. The stream is
     tied to `chat` (not the active view) so navigating away won't stop it. */
 async function runAssistant(chat, tier, replyLang, convoOverride) {
+  // Firas Agent chats run the AGENT pipeline (plan → execute → verify → deliver).
+  if (chat.agent) return runAgentAssistant(chat, tier, replyLang);
   const aiMsg = { role: "assistant", content: "", reasoning: "", tier, lang: replyLang, mode: state.mode };
   chat.messages.push(aiMsg);
 
@@ -6066,7 +7114,7 @@ async function openKbManager() {
         '<button class="mem-x" aria-label="close">' + ANN_SVG_X + '</button></div>' +
       '<div style="display:flex;flex-direction:column;gap:9px;margin:0 0 14px">' +
         '<input class="ann-in kb-title" type="text" maxlength="200" placeholder="' + tx.titleP + '">' +
-        '<label class="ann-img-btn" style="text-align:center;cursor:pointer">' + tx.pick + '<input type="file" accept=".pdf,.txt,.md,text/plain" class="kb-file" hidden></label>' +
+        '<label class="ann-img-btn" style="text-align:center;cursor:pointer">' + tx.pick + '<input type="file" accept=".pdf,.txt,.md,.markdown,.csv,.tex,.html,.htm,text/plain,text/markdown,text/csv,text/html,application/pdf" class="kb-file" hidden></label>' +
         '<span class="kb-status" style="font-size:13px;line-height:1.6;color:#A9A69D;min-height:18px"></span>' +
       '</div>' +
       '<ul class="mem-list kb-list"></ul>' +
@@ -6100,15 +7148,40 @@ async function openKbManager() {
   fileEl.addEventListener("change", async () => {
     const f = fileEl.files && fileEl.files[0];
     if (!f) return;
+    const arUi = state.lang === "ar";
+    fileEl.disabled = true;                       // no double-submits while a big book processes
     statusEl.textContent = tx.uploading;
     try {
-      const text = /\.pdf$/i.test(f.name) ? await extractPdfTextForKb(f) : await f.text();
+      let text;
+      if (/\.pdf$/i.test(f.name)) {
+        text = await extractPdfTextForKb(f, (i, n) => { statusEl.textContent = arUi ? ("يستخرج الصفحة " + i + "/" + n + "…") : ("Extracting page " + i + "/" + n + "…"); });
+      } else if (/\.html?$/i.test(f.name)) {
+        const div = document.createElement("div"); div.innerHTML = await f.text(); text = div.textContent || "";
+      } else {
+        text = await f.text();                    // .md / .txt / .csv / .tex … accepted as-is
+      }
       const title = titleEl.value.trim() || f.name.replace(/\.[^.]+$/, "");
-      const r = await apiJson("/api/kb", { method: "POST", body: JSON.stringify({ title, text }) });
-      statusEl.textContent = tx.added(title, (r && r.chunks) || 0);
+      // ANY-size support: split into parts and upload sequentially — each part is its own KB
+      // entry ("Book — part i/N"), safely under the backend chunk cap + edge body limit.
+      const parts = splitKbText(text);
+      let totalChunks = 0;
+      for (let i = 0; i < parts.length; i++) {
+        if (parts.length > 1) statusEl.textContent = arUi ? ("يرفع الجزء " + (i + 1) + "/" + parts.length + "…") : ("Uploading part " + (i + 1) + "/" + parts.length + "…");
+        const partTitle = parts.length > 1 ? (title + " — " + (i + 1) + "/" + parts.length) : title;
+        try {
+          const r = await apiJson("/api/kb", { method: "POST", body: JSON.stringify({ title: partTitle, text: parts[i] }) });
+          totalChunks += (r && r.chunks) || 0;
+        } catch (e) {
+          statusEl.textContent = (e && e.status === 403) ? tx.notAdmin
+            : (arUi ? ("توقّف عند الجزء " + (i + 1) + "/" + parts.length + " — المرفوع قبله محفوظ؛ أعد المحاولة.") : ("Stopped at part " + (i + 1) + "/" + parts.length + " — earlier parts saved; retry."));
+          fileEl.disabled = false; renderList(); return;
+        }
+      }
+      statusEl.textContent = tx.added(title, totalChunks) + (parts.length > 1 ? (arUi ? " (" + parts.length + " أجزاء)" : " (" + parts.length + " parts)") : "");
       titleEl.value = ""; fileEl.value = "";
       renderList();
     } catch (e) { statusEl.textContent = (e && e.status === 403) ? tx.notAdmin : tx.err; }
+    fileEl.disabled = false;
   });
 }
 
@@ -7188,6 +8261,10 @@ function wireEvents() {
   // New chat (sidebar + topbar)
   $("#newChatBtn").addEventListener("click", () => { newChat(); closeDrawer(); });
   $("#topbarNewChat").addEventListener("click", newChat);
+  const shareBtn = document.getElementById("shareChatBtn");
+  if (shareBtn) shareBtn.addEventListener("click", shareActiveChat);
+  const prodBtn = document.getElementById("productSwitch");
+  if (prodBtn) prodBtn.addEventListener("click", openProductMenu);
 
   // Theme
   els.themeToggle.addEventListener("click", () => applyTheme(state.theme === "light" ? "dark" : "light"));
@@ -7257,7 +8334,11 @@ function wireEvents() {
 
   // Scroll
   els.chatScroll.addEventListener("scroll", onScroll, { passive: true });
-  els.scrollBottomBtn.addEventListener("click", () => { autoScroll = true; scrollToBottom(); });
+  els.scrollBottomBtn.addEventListener("click", () => {
+    autoScroll = true;
+    // the manual button keeps the smooth glide (programmatic pins are instant)
+    els.chatScroll.scrollTo({ top: els.chatScroll.scrollHeight, behavior: "smooth" });
+  });
 
   // Auto-resume any interrupted reply the moment we're foreground + online again (so a task fired
   // before switching apps / losing signal finishes itself on return — no "retry").
@@ -7301,6 +8382,566 @@ function startVersionWatch() {
   setInterval(check, 15000);
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   FIRAS AGENT — a real agent: PLANS the task, EXECUTES it step by step (with
+   web research, math, figures, code), REVIEWS its own work, and DELIVERS the
+   result (as a file card when a document was asked for). The whole run lives
+   in ONE persisted ```firas-agent block so it re-renders after reload.
+   ════════════════════════════════════════════════════════════════════════════ */
+/* ── ZIP builder (store method, zero deps) — downloads a multi-file project as a real folder ── */
+const CRC_TABLE = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function buildZip(files) {
+  const enc = new TextEncoder(); const parts = []; const central = []; let offset = 0;
+  for (const f of files) {
+    const name = enc.encode(String(f.path)); const data = enc.encode(String(f.content));
+    const crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true);
+    lh.setUint16(26, name.length, true);
+    parts.push(new Uint8Array(lh.buffer), name, data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true); cd.setUint16(4, 20, true); cd.setUint16(6, 20, true); cd.setUint16(8, 0x0800, true);
+    cd.setUint32(16, crc, true); cd.setUint32(20, data.length, true); cd.setUint32(24, data.length, true);
+    cd.setUint16(28, name.length, true); cd.setUint32(42, offset, true);
+    central.push(new Uint8Array(cd.buffer), name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((s, a) => s + a.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type: "application/zip" });
+}
+/* Extract the code from a step output: the LARGEST fenced block (or the raw text when unfenced). */
+function stripToCode(out) {
+  const blocks = [...String(out || "").matchAll(/```[\w-]*\n([\s\S]*?)```/g)].map((m) => m[1]);
+  if (!blocks.length) return String(out || "").trim();
+  return blocks.sort((a, b) => b.length - a.length)[0].trim();
+}
+/* ── Multi-file PROJECT deliverable (folder) — persisted as a ```firas-project block ── */
+function parseProjectMeta(content) {
+  const m = /^\s*```firas-project\s*\n([\s\S]*?)\n```\s*$/.exec(String(content || ""));
+  if (!m) return null;
+  try { const o = JSON.parse(m[1]); return (o && Array.isArray(o.files) && o.files.length) ? o : null; } catch (_) { return null; }
+}
+function projFileLang(path) { const e = String(path).split(".").pop().toLowerCase(); return ({ js: "javascript", mjs: "javascript", ts: "typescript", html: "html", htm: "html", css: "css", json: "json", py: "python", md: "markdown", svg: "xml", txt: "" })[e] || e; }
+function buildProjectCard(proj, lang) {
+  const ar = lang === "ar";
+  const card = document.createElement("div");
+  card.className = "proj-card";
+  const total = proj.files.reduce((s, f) => s + (f.content || "").length, 0);
+  const head = document.createElement("div");
+  head.className = "proj-card__head";
+  head.innerHTML = '<span class="proj-card__ic">📁</span><div class="proj-card__meta"><div class="proj-card__name">' + escapeHtml(proj.name || "project") + "</div>" +
+    '<div class="proj-card__sub">' + proj.files.length + (ar ? " ملفات · " : " files · ") + Math.max(1, Math.round(total / 1024)) + " KB</div></div>";
+  const zipBtn = document.createElement("button");
+  zipBtn.type = "button"; zipBtn.className = "proj-card__zip";
+  zipBtn.textContent = ar ? "⬇ تنزيل الفولدر (ZIP)" : "⬇ Download folder (ZIP)";
+  zipBtn.addEventListener("click", () => {
+    const folder = String(proj.name || "project").replace(/[^\w.-]+/g, "-");
+    const blob = buildZip(proj.files.map((f) => ({ path: folder + "/" + f.path, content: f.content })));
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = folder + ".zip";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+  });
+  head.appendChild(zipBtn);
+  card.appendChild(head);
+  const list = document.createElement("div");
+  list.className = "proj-card__files";
+  proj.files.forEach((f) => {
+    const row = document.createElement("div");
+    row.className = "proj-file";
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "proj-file__row";
+    btn.innerHTML = '<span class="proj-file__ic">📄</span><span class="proj-file__path">' + escapeHtml(f.path) + '</span><span class="proj-file__size">' + Math.max(1, Math.round((f.content || "").length / 1024)) + ' KB</span><span class="proj-file__chev">▾</span>';
+    const body = document.createElement("div");
+    body.className = "proj-file__body"; body.hidden = true;
+    btn.addEventListener("click", () => {
+      body.hidden = !body.hidden;
+      row.classList.toggle("is-open", !body.hidden);
+      if (!body.hidden && !body.firstChild) {
+        const pre = document.createElement("pre"); const code = document.createElement("code");
+        code.className = "language-" + projFileLang(f.path);
+        code.textContent = f.content || "";
+        pre.appendChild(code); body.appendChild(pre);
+        if (typeof window.hljs !== "undefined") { try { window.hljs.highlightElement(code); } catch (_) {} }
+      }
+    });
+    row.appendChild(btn); row.appendChild(body); list.appendChild(row);
+  });
+  card.appendChild(list);
+  return card;
+}
+
+function parseAgentMeta(content) {
+  const m = /^\s*```firas-agent\s*\n([\s\S]*?)\n```/.exec(String(content || ""));
+  if (!m) return null;
+  try { const o = JSON.parse(m[1]); return (o && Array.isArray(o.steps)) ? o : null; } catch (_) { return null; }
+}
+function serializeAgentRun(run) {
+  const slim = {
+    task: String(run.task || "").slice(0, 4000),
+    title: String(run.title || "").slice(0, 160),
+    phase: run.phase, lang: run.lang, mode: run.mode || "answer",
+    steps: run.steps.map((s) => ({ title: String(s.title || "").slice(0, 200), kind: s.kind, file: s.file || "", s: s.s, out: String(s.out || "").slice(0, 15000) })),
+    final: String(run.final || "").slice(0, 60000),
+  };
+  return "```firas-agent\n" + JSON.stringify(slim) + "\n```";
+}
+const AGENT_PHASE_LABEL = {
+  plan:    { ar: "يخطّط…", en: "Planning…" },
+  run:     { ar: "ينفّذ…", en: "Executing…" },
+  verify:  { ar: "يراجع نفسه…", en: "Self-reviewing…" },
+  assemble:{ ar: "يجمّع النتيجة…", en: "Assembling…" },
+  done:    { ar: "اكتملت المهمة", en: "Task complete" },
+  stopped: { ar: "أُوقفت", en: "Stopped" },
+  fail:    { ar: "تعثّرت", en: "Failed" },
+};
+function buildAgentCard(run, lang) {
+  const ar = (run.lang || lang) === "ar";
+  const card = document.createElement("div");
+  card.className = "agent-card" + (run.phase === "done" ? " is-done" : "");
+  const phase = AGENT_PHASE_LABEL[run.phase] || AGENT_PHASE_LABEL.run;
+  const head = document.createElement("div");
+  head.className = "agent-card__head";
+  head.innerHTML = '<span class="agent-card__bolt">⚡</span><span class="agent-card__brand">Firas Agent</span>' +
+    '<span class="agent-card__phase' + (run.phase === "run" || run.phase === "plan" || run.phase === "verify" ? " is-live" : "") + '">' + (ar ? phase.ar : phase.en) + "</span>";
+  card.appendChild(head);
+  if (run.title) { const h = document.createElement("div"); h.className = "agent-card__title"; h.textContent = run.title; card.appendChild(h); }
+  // Progress bar: n/N done + animated fill.
+  const doneN = run.steps.filter((s) => s.s === "done").length;
+  const pct = run.steps.length ? Math.round(doneN / run.steps.length * 100) : 0;
+  const prog = document.createElement("div");
+  prog.className = "agent-card__prog";
+  prog.innerHTML = '<div class="agent-card__prog-bar"><div class="agent-card__prog-fill" style="width:' + pct + '%"></div></div>' +
+    '<span class="agent-card__prog-n">' + doneN + "/" + run.steps.length + "</span>";
+  card.appendChild(prog);
+  const KIND_IC = { research: "🔎", write: "✍️", solve: "🧮", draw: "📈", code: "💻" };
+  const ol = document.createElement("ol");
+  ol.className = "agent-card__steps";
+  run.steps.forEach((st) => {
+    const li = document.createElement("li");
+    li.className = "agent-step is-" + (st.s || "todo");
+    const ic = st.s === "done" ? "✓" : st.s === "run" ? "" : st.s === "fail" ? "!" : "";
+    const icon = '<span class="agent-step__ic">' + (st.s === "run" ? '<span class="agent-step__spin"></span>' : ic) + "</span>";
+    const kindIc = '<span class="agent-step__kind">' + (KIND_IC[st.kind] || "✍️") + "</span>";
+    const fileChip = st.file ? ' <code class="agent-step__file" dir="ltr">' + escapeHtml(st.file) + "</code>" : "";
+    const titleHtml = '<span class="agent-step__t">' + kindIc + escapeHtml(st.title) + fileChip + "</span>";
+    if (st.out && st.s === "done") {
+      const det = document.createElement("details");
+      det.className = "agent-step__det";
+      det.innerHTML = "<summary>" + icon + titleHtml + "</summary>";
+      const body = document.createElement("div");
+      body.className = "md agent-step__out";
+      body.innerHTML = renderMarkdown(st.out);
+      decorateMarkdown(body); typesetMath(body);
+      det.appendChild(body);
+      li.appendChild(det);
+    } else {
+      li.innerHTML = icon + titleHtml;
+    }
+    ol.appendChild(li);
+  });
+  card.appendChild(ol);
+  if (run.final) {
+    const fin = document.createElement("div");
+    fin.className = "agent-card__final";
+    fin.innerHTML = '<div class="agent-card__final-label">' + (ar ? "📦 النتيجة" : "📦 Result") + "</div>";
+    const md = document.createElement("div");
+    md.className = "md";
+    md.innerHTML = renderMarkdown(run.final);
+    decorateMarkdown(md); typesetMath(md);
+    fin.appendChild(md);
+    card.appendChild(fin);
+  }
+  return card;
+}
+/* Robust model call for agent steps: 3 attempts with backoff — a step must not die on a hiccup. */
+async function agentCall(messages, tierKey, signal) {
+  let lastErr = null;
+  for (let a = 0; a < 3; a++) {
+    try {
+      const out = await callAgentText(messages, tierKey, signal);
+      if (out && out.trim()) return out.trim();
+    } catch (e) { lastErr = e; if (signal && signal.aborted) throw e; }
+    await new Promise((r) => setTimeout(r, 900 * (a + 1)));
+  }
+  throw (lastErr || new Error("agent call failed"));
+}
+async function agentWebSearch(q) {
+  try {
+    const r = await fetch("/api/search?q=" + encodeURIComponent(String(q).slice(0, 280)), { credentials: "same-origin" });
+    if (!r.ok) return "";
+    const d = await r.json();
+    const res = Array.isArray(d.results) ? d.results.slice(0, 6) : [];
+    return res.map((x, i) => "[" + (i + 1) + "] " + (x.title || "") + "\n" + (x.snippet || "") + "\n" + (x.url || "")).join("\n\n");
+  } catch (_) { return ""; }
+}
+const AGENT_QUALITY =
+  " QUALITY BAR: expert-level, complete, ZERO errors. ALL math in valid, BALANCED KaTeX LaTeX ($…$ inline, $$…$$ display" +
+  " for standalone equations only). Function graphs as a fenced ```plot block (lines `y = <expr>` with explicit operators" +
+  " + optional `domain: a..b`). Geometric/physics figures as a SIMPLE fenced ```tikz block (explicit coordinates, basic" +
+  " \\draw/\\node only). Code in fenced blocks with the language tag. NEVER lazy placeholders, NEVER meta commentary.";
+async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate) {
+  const ar = replyLang === "ar";
+  const langRule = ar ? " Respond entirely in Arabic (الفصحى الواضحة)." : " Respond in English.";
+  const run = { task, title: "", phase: "plan", lang: replyLang, steps: [], final: "", mode: "answer" };
+  // DELIVERABLE MODE: doc (PDF/Word…) · codefile (ONE complete code file — user asked "بكود واحد")
+  // · project (a real multi-file FOLDER, downloadable as ZIP — the default for sites/apps) · answer.
+  const wantsDoc = typeof detectFileRequest === "function" ? detectFileRequest(task) : null;
+  const codeSpec = !wantsDoc && typeof detectCodeRequest === "function" ? detectCodeRequest(task) : null;
+  const oneFile = /كود\s*واحد|بكود\s*واحد|ملف\s*واحد|بملف\s*واحد|one\s*file|single\s*file/i.test(task);
+  run.mode = wantsDoc ? "doc" : (codeSpec ? (oneFile ? "codefile" : "project") : "answer");
+  const sync = (persist) => { aiMsg.content = serializeAgentRun(run); onUpdate(run, persist); };
+  sync(false);
+  // 1) PLAN — mode-specific decomposition
+  const plannerSysTxt =
+    run.mode === "project"
+      ? "You are Firas Agent's ARCHITECT planning a MULTI-FILE PROJECT (a real folder the user downloads). Design a clean professional file structure of 3-6 files (e.g. index.html, css/styles.css, js/app.js, README.md — adapt to the task/stack). EACH step builds exactly ONE file and MUST carry a \"file\" field with its path. Order foundations first. Return ONLY valid JSON, step titles in the user's language: {\"title\":\"short project name\",\"steps\":[{\"title\":\"…\",\"kind\":\"code\",\"file\":\"path\"}]}"
+      : run.mode === "codefile"
+      ? "You are Firas Agent's ARCHITECT planning ONE COMPLETE single-file build, produced in SECTIONS so the final file is far larger and richer than a one-shot answer. Split into 3-7 steps (foundation & layout → each major section/feature → styling polish → JavaScript interactivity). Return ONLY valid JSON, titles in the user's language: {\"title\":\"…\",\"steps\":[{\"title\":\"…\",\"kind\":\"code\"}]}"
+      : "You are Firas Agent's PLANNER. Decompose the user's task into 3-8 CONCRETE, executable steps that together produce the COMPLETE deliverable (each step = one chunk of real content, e.g. one chapter/section/part — not vague activities). If a step genuinely needs fresh web facts, set its kind to \"research\". Kinds: research | write | solve | draw | code. Return ONLY valid JSON, in the user's language: {\"title\":\"short task title\",\"steps\":[{\"title\":\"…\",\"kind\":\"…\"}]}";
+  let plan = null;
+  try {
+    const raw = await agentCall([
+      { role: "system", content: plannerSysTxt },
+      { role: "user", content: task.slice(0, 4000) },
+    ], "pro", signal);
+    const jm = raw.match(/\{[\s\S]*\}/);
+    plan = jm ? JSON.parse(jm[0]) : null;
+  } catch (_) { plan = null; }
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) {
+    plan = { title: task.slice(0, 60), steps: [{ title: ar ? "تنفيذ المهمة كاملة" : "Execute the full task", kind: run.mode === "project" || run.mode === "codefile" ? "code" : "write", file: run.mode === "project" ? "index.html" : "" }] };
+  }
+  run.title = String(plan.title || "").slice(0, 120);
+  run.steps = plan.steps.slice(0, 8).map((s) => ({
+    title: String(s.title || "").slice(0, 160),
+    kind: /^(research|solve|draw|code)$/.test(s.kind) ? s.kind : (run.mode === "project" || run.mode === "codefile" ? "code" : "write"),
+    file: run.mode === "project" ? String(s.file || "").replace(/[^\w./-]+/g, "-").replace(/^[/.]+/, "").slice(0, 80) : "",
+    s: "todo", out: "",
+  }));
+  if (run.mode === "project") run.steps = run.steps.filter((s) => s.file).slice(0, 6);
+  if (!run.steps.length) run.steps = [{ title: ar ? "تنفيذ المهمة" : "Execute the task", kind: "code", file: "index.html", s: "todo", out: "" }];
+  run.phase = "run";
+  sync(true);
+  // 2) EXECUTE — step by step, each sees the plan + summaries of what's done
+  const planList = run.steps.map((s, i) => (i + 1) + ". " + s.title).join("\n");
+  const stepTier = (k) => (k === "code" ? "ultra" : "pro");
+  const prevOutline = () => run.steps.filter((s) => s.s === "done").map((s, i) => "— " + s.title + ":\n" + s.out.slice(0, 1400)).join("\n\n").slice(0, 11000);
+  for (let i = 0; i < run.steps.length; i++) {
+    if (signal.aborted) { run.phase = "stopped"; sync(true); return run; }
+    const st = run.steps[i];
+    st.s = "run"; sync(false);
+    let searchCtx = "";
+    if (st.kind === "research") searchCtx = await agentWebSearch(st.title + " " + task.slice(0, 120));
+    let sysTxt, usrTxt;
+    if (run.mode === "project") {
+      const built = run.steps.filter((s) => s.s === "done" && s.file).map((s) => "===== " + s.file + " (already built) =====\n" + stripToCode(s.out).slice(0, 1800)).join("\n\n").slice(0, 10000);
+      sysTxt = "You are Firas Agent building ONE FILE of a professional multi-file project. Output ONLY the COMPLETE, FINAL content of the file `" + st.file + "` in ONE fenced code block — no commentary, no omissions, never stop mid-file. PRODUCTION-GRADE and thorough; stay perfectly CONSISTENT with the other files (ids, classes, imports, paths). User-facing text in the interface must be in the user's language.";
+      usrTxt = "THE TASK:\n" + task.slice(0, 3000) + "\n\nPROJECT FILES (plan):\n" + run.steps.map((s) => "- " + s.file + " — " + s.title).join("\n") + (built ? "\n\nFILES ALREADY BUILT:\n" + built : "") + "\n\nBUILD THIS FILE NOW, COMPLETE: " + st.file;
+    } else if (run.mode === "codefile") {
+      const built = prevOutline();
+      sysTxt = "You are Firas Agent building ONE SECTION of a single-file deliverable (all sections get merged into ONE complete file at the end). Output ONLY this section's code in ONE fenced code block — thorough, production-grade, consistent with the sections already built (same ids/classes/design system). No commentary.";
+      usrTxt = "THE TASK:\n" + task.slice(0, 3000) + "\n\nFULL PLAN:\n" + planList + (built ? "\n\nSECTIONS ALREADY BUILT (stay consistent — do not repeat):\n" + built : "") + "\n\nBUILD SECTION " + (i + 1) + " NOW: " + st.title;
+    } else {
+      sysTxt = "You are Firas Agent EXECUTING ONE STEP of a bigger plan. Produce the COMPLETE, final content for THIS step only — it will be assembled with the other steps into the deliverable." + AGENT_QUALITY + langRule;
+      usrTxt = "THE TASK:\n" + task.slice(0, 3000) + "\n\nFULL PLAN:\n" + planList + (prevOutline() ? "\n\nALREADY COMPLETED (context — do not repeat):\n" + prevOutline() : "") + (searchCtx ? "\n\nFRESH WEB RESULTS (cite [1][2] where used):\n" + searchCtx : "") + "\n\nEXECUTE STEP " + (i + 1) + " NOW: " + st.title;
+    }
+    try {
+      st.out = await agentCall([
+        { role: "system", content: sysTxt },
+        { role: "user", content: usrTxt },
+      ], stepTier(st.kind), signal);
+      st.s = "done";
+    } catch (e) {
+      if (signal.aborted) { st.s = "todo"; run.phase = "stopped"; sync(true); return run; }
+      st.s = "fail"; st.out = "";
+    }
+    sync(true);
+  }
+  // 3) SELF-REVIEW — catch broken LaTeX / lazy or missing content, re-run flagged steps once
+  if (!signal.aborted && run.steps.some((s) => s.s === "done")) {
+    run.phase = "verify"; sync(false);
+    try {
+      const rev = await agentCall([
+        { role: "system", content: "You are Firas Agent's strict REVIEWER. Inspect the step outputs against the task: flag any step that is INCOMPLETE, lazy, off-task, or contains INVALID/unbalanced LaTeX or a broken ```plot/```tikz block. Return ONLY JSON: {\"ok\":true} or {\"redo\":[stepNumbers],\"notes\":\"precise fixes\"}." },
+        { role: "user", content: "TASK:\n" + task.slice(0, 1500) + "\n\n" + run.steps.map((s, i) => "STEP " + (i + 1) + " (" + s.title + "):\n" + s.out.slice(0, 2500)).join("\n\n---\n\n") },
+      ], "pro", signal);
+      const jm = rev.match(/\{[\s\S]*\}/);
+      const verdict = jm ? JSON.parse(jm[0]) : { ok: true };
+      const redo = (!verdict.ok && Array.isArray(verdict.redo)) ? verdict.redo.slice(0, 3) : [];
+      for (const n of redo) {
+        const st = run.steps[n - 1];
+        if (!st || signal.aborted) continue;
+        st.s = "run"; sync(false);
+        try {
+          st.out = await agentCall([
+            { role: "system", content: "You are Firas Agent REDOING one step after review." + AGENT_QUALITY + langRule },
+            { role: "user", content: "THE TASK:\n" + task.slice(0, 3000) + "\n\nREVIEWER'S FIXES TO APPLY:\n" + String(verdict.notes || "").slice(0, 1500) + "\n\nREDO STEP " + n + " COMPLETELY: " + st.title + "\n\nPREVIOUS (flawed) OUTPUT:\n" + st.out.slice(0, 5000) },
+          ], stepTier(st.kind), signal);
+          st.s = "done";
+        } catch (_) { st.s = st.out ? "done" : "fail"; }
+        sync(true);
+      }
+    } catch (_) { /* review is best-effort */ }
+  }
+  // Failed steps: one last direct retry so the deliverable is never missing a piece silently.
+  for (let i = 0; i < run.steps.length; i++) {
+    const st = run.steps[i];
+    if (st.s !== "fail" || signal.aborted) continue;
+    st.s = "run"; sync(false);
+    try {
+      st.out = await agentCall([
+        { role: "system", content: "You are Firas Agent." + AGENT_QUALITY + langRule },
+        { role: "user", content: "TASK:\n" + task.slice(0, 3000) + "\n\nEXECUTE THIS PART COMPLETELY: " + st.title },
+      ], "pro", signal);
+      st.s = "done";
+    } catch (_) { st.s = "fail"; }
+    sync(true);
+  }
+  // 4) ASSEMBLE — merge sections into ONE polished file / collect the project's files
+  if (run.mode === "codefile" && !signal.aborted && run.steps.some((s) => s.s === "done")) {
+    run.phase = "assemble"; sync(false);
+    try {
+      const merged = await agentCall([
+        { role: "system", content: "You are Firas Agent's INTEGRATOR. Merge the section outputs into ONE complete, coherent, production-quality file. Include EVERYTHING from every section (deduplicate overlapping boilerplate, unify the design system), fix any inconsistency, and output ONLY the final file in ONE fenced code block — no commentary, never stop mid-file." },
+        { role: "user", content: "THE TASK:\n" + task.slice(0, 2000) + "\n\nSECTIONS TO MERGE:\n" + run.steps.filter((s) => s.s === "done").map((s, i) => "===== SECTION " + (i + 1) + ": " + s.title + " =====\n" + stripToCode(s.out)).join("\n\n").slice(0, 90000) },
+      ], "ultra", signal);
+      run._code = stripToCode(merged);
+      if (run._code.length < 400) throw new Error("merge too small");
+    } catch (_) {
+      // integrator failed → naive but complete merge so the user still gets the whole build
+      run._code = run.steps.filter((s) => s.s === "done").map((s) => stripToCode(s.out)).join("\n\n");
+    }
+  }
+  if (run.mode === "project") {
+    run._files = run.steps.filter((s) => s.s === "done" && s.file && s.out).map((s) => ({ path: s.file, content: stripToCode(s.out) }));
+  }
+  // 5) DELIVER
+  run.phase = "done";
+  run.final =
+    run.mode === "codefile" ? (ar ? "اكتمل البناء ✓ — الكود الكامل تحت 👇" : "Build complete ✓ — the full code is below 👇")
+    : run.mode === "project" ? (ar ? "اكتمل المشروع ✓ — الفولدر الجاهز تحت 👇" : "Project complete ✓ — your folder is below 👇")
+    : run.mode === "doc" ? (ar ? "اكتملت المهمة ✓ — الملف الجاهز تحت 👇" : "Task complete ✓ — your file is below 👇")
+    : (ar ? "اكتملت المهمة ✓ — افتح الخطوات أعلاه لقراءة كل جزء." : "Task complete ✓ — open the steps above to read each part.");
+  sync(true);
+  return run;
+}
+/** Agent-mode assistant turn: plan → execute → verify → deliver, streamed into a live plan card. */
+async function runAgentAssistant(chat, tier, replyLang) {
+  const lastUser = [...chat.messages].reverse().find((m) => m.role === "user");
+  const task = lastUser ? String(lastUser.content || "") : "";
+  const aiMsg = { role: "assistant", content: "", reasoning: "", tier, lang: replyLang, mode: state.mode };
+  chat.messages.push(aiMsg);
+  autoScroll = true;
+  renderThread(chat, true);
+  const controller = new AbortController();
+  activeStreams.set(chat.id, { controller, aiMsg });
+  beginStreaming(chat.id);
+  const rerenderCard = (run, persist) => {
+    if (activeChat() === chat) {
+      const idx = chat.messages.indexOf(aiMsg);
+      const node = els.thread.querySelector(`.msg-ai[data-index="${idx}"] .msg-ai__body .md`);
+      if (node) {
+        // Preserve open/closed state of step disclosures across live re-renders.
+        const openSet = new Set([...node.querySelectorAll(".agent-step__det[open]")].map((d) => d.querySelector(".agent-step__t") && d.querySelector(".agent-step__t").textContent));
+        node.innerHTML = "";
+        const card = buildAgentCard(run, replyLang);
+        card.querySelectorAll(".agent-step__det").forEach((d) => { const t = d.querySelector(".agent-step__t"); if (t && openSet.has(t.textContent)) d.open = true; });
+        node.appendChild(card);
+        if (autoScroll) scrollToBottom();
+      }
+    }
+    if (persist) { chat.updatedAt = Date.now(); persistChat(chat); }
+  };
+  try {
+    const run = await runAgentTask(chat, aiMsg, task, replyLang, controller.signal, rerenderCard);
+    if (run.phase === "done") {
+      if (run.mode === "codefile" && run._code) {
+        // ONE complete code file → the real code card (copy / download / live preview).
+        const spec = (typeof detectCodeRequest === "function" ? detectCodeRequest(task) : null) || { filename: "index", lang: "html", ext: "html", label: "HTML" };
+        const meta = { filename: spec.filename || "index", lang: spec.lang || "html", ext: spec.ext || "html", label: spec.label || (spec.lang || "code").toUpperCase() };
+        chat.messages.push({ role: "assistant", content: "```firas-code " + JSON.stringify(meta) + "\n" + run._code + "\n```", reasoning: "", tier, lang: replyLang, mode: state.mode });
+      } else if (run.mode === "project" && run._files && run._files.length) {
+        // Multi-file FOLDER → project card with per-file viewer + ZIP download.
+        const name = (run.title || task.slice(0, 30)).replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 60) || "project";
+        const files = run._files.slice(0, 6).map((f) => ({ path: f.path, content: String(f.content).slice(0, 28000) }));
+        chat.messages.push({ role: "assistant", content: "```firas-project\n" + JSON.stringify({ name, files }) + "\n```", reasoning: "", tier, lang: replyLang, mode: state.mode });
+      } else if (run.mode === "doc" && run.steps.some((s) => s.s === "done" && s.out)) {
+        // Document → the real downloadable file card (PDF/Word…).
+        const docBody = run.steps.filter((s) => s.s === "done" && s.out).map((s) => s.out).join("\n\n");
+        const meta = { filename: (run.title || task.slice(0, 40)).replace(/[\\/:*?"<>|]/g, " ").trim(), title: run.title || task.slice(0, 60), subtitle: "", theme: "teal" };
+        const finalDoc = metaBlockString(meta) + "\n\n" + sanitizeBareLatex(fixMathBlanks(tightenInlineMath(docBody)));
+        chat.messages.push({ role: "assistant", content: finalDoc, reasoning: "", tier, lang: replyLang, mode: state.mode });
+      }
+    }
+  } catch (e) {
+    if (!controller.signal.aborted) {
+      const cur = parseAgentMeta(aiMsg.content);
+      if (cur) { cur.phase = "fail"; aiMsg.content = "```firas-agent\n" + JSON.stringify(cur) + "\n```"; }
+    }
+  } finally {
+    activeStreams.delete(chat.id);
+    endStreaming(chat.id);
+    chat.updatedAt = Date.now();
+    persistChat(chat);
+    if (activeChat() === chat) renderThread(chat);
+    renderHistory();
+  }
+}
+
+/* ── Product switcher: Firas AI / Firas Agent / Firas Code ────────────────── */
+const PRODUCTS = {
+  ai:    { name: "Firas AI",    tag: { ar: "المحادثة الذكية", en: "Smart chat" } },
+  agent: { name: "Firas Agent", tag: { ar: "وكيل ينفّذ المهام الكبيرة", en: "Executes big tasks" } },
+  code:  { name: "Firas Code",  tag: { ar: "تحت التطوير 🚧", en: "In development 🚧" }, locked: true },
+};
+function updateProductUi() {
+  const agent = state.product === "agent";
+  document.body.classList.toggle("product-agent", agent);
+  const nameEl = document.getElementById("productSwitchName");
+  if (nameEl) nameEl.textContent = PRODUCTS[state.product].name;
+  // Shell wordmarks flip: "Firas AI" ↔ "Firas Agent" (sidebar + topbar + mobile center)
+  document.querySelectorAll(".wordmark .ai").forEach((el) => { el.textContent = agent ? "Agent" : "AI"; });
+  if (agent && els && els.input) {
+    els.input.setAttribute("placeholder", state.lang === "ar"
+      ? "كلّف فِراس بمهمة كبيرة… (كورس كامل، بحث، كتاب، مشروع)"
+      : "Give Firas a big task… (a full course, a paper, a book, a project)");
+  }
+}
+function setProduct(p) {
+  if (!PRODUCTS[p]) return;
+  if (PRODUCTS[p].locked) { showUnderDevModal(PRODUCTS[p].name); return; }
+  if (state.product === p) return;
+  state.product = p;
+  localStorage.setItem(LS_PRODUCT, p);
+  state.activeId = null;          // each product opens on its own home screen
+  state.search = "";
+  if (els.searchInput) els.searchInput.value = "";
+  applyShellLang(state.lang);     // restore base labels/placeholders, then theme via updateProductUi
+  renderAll();
+  syncStreamingUi();
+}
+function openProductMenu() {
+  const old = document.getElementById("firasProductMenu"); if (old) { old.remove(); return; }
+  const btn = document.getElementById("productSwitch"); if (!btn) return;
+  const ar = state.lang === "ar";
+  const menu = document.createElement("div");
+  menu.id = "firasProductMenu"; menu.className = "product-menu";
+  Object.keys(PRODUCTS).forEach((key) => {
+    const p = PRODUCTS[key];
+    const it = document.createElement("button");
+    it.type = "button";
+    it.className = "product-menu__item" + (key === state.product ? " is-active" : "") + (p.locked ? " is-locked" : "");
+    it.innerHTML =
+      '<span class="product-menu__name">' + p.name + (p.locked ? ' <span class="product-menu__soon">' + (ar ? "قريبًا" : "soon") + "</span>" : "") + "</span>" +
+      '<span class="product-menu__tag">' + (p.tag[ar ? "ar" : "en"]) + "</span>" +
+      (key === state.product ? '<span class="product-menu__check">✓</span>' : "");
+    it.addEventListener("click", () => { menu.remove(); setProduct(key); });
+    menu.appendChild(it);
+  });
+  document.body.appendChild(menu);
+  const r = btn.getBoundingClientRect();
+  menu.style.top = (r.bottom + 6) + "px";
+  const isRtl = document.documentElement.dir === "rtl";
+  if (isRtl) menu.style.right = Math.max(8, window.innerWidth - r.right) + "px";
+  else menu.style.left = Math.max(8, r.left) + "px";
+  setTimeout(() => {
+    const onDown = (e) => { if (!menu.contains(e.target) && e.target !== btn) { menu.remove(); document.removeEventListener("pointerdown", onDown, true); } };
+    document.addEventListener("pointerdown", onDown, true);
+  }, 0);
+}
+function showUnderDevModal(name) {
+  const old = document.getElementById("firasDevModal"); if (old) old.remove();
+  const ar = state.lang === "ar";
+  const ov = document.createElement("div");
+  ov.id = "firasDevModal"; ov.className = "dev-modal";
+  ov.innerHTML =
+    '<div class="dev-modal__card" role="dialog" aria-modal="true">' +
+      '<div class="dev-modal__icon">🚧</div>' +
+      '<h3 class="dev-modal__title">' + name + "</h3>" +
+      '<p class="dev-modal__body">' + (ar
+        ? "هذا القسم تحت التطوير والتجريب حاليًا.<br>يرجى انتظار التحديثات القادمة."
+        : "This section is under development and testing.<br>Please wait for upcoming updates.") + "</p>" +
+      '<button type="button" class="dev-modal__ok">' + (ar ? "حسنًا" : "OK") + "</button>" +
+    "</div>";
+  const close = () => ov.remove();
+  ov.addEventListener("click", (e) => { if (e.target === ov) close(); });
+  ov.querySelector(".dev-modal__ok").addEventListener("click", close);
+  document.body.appendChild(ov);
+}
+
+/* ── Share: publish the open chat as a read-only public link ─────────────── */
+async function shareActiveChat() {
+  const ar = state.lang === "ar";
+  const chat = activeChat();
+  if (!chat || !chat.messages || !chat.messages.length) { showToast(ar ? "افتح محادثة فيها رسائل أولًا" : "Open a chat with messages first"); return; }
+  showToast(ar ? "ينشئ رابط المشاركة…" : "Creating share link…");
+  try {
+    const r = await apiJson("/api/share", { method: "POST", body: JSON.stringify({ chatId: chat.id }) });
+    if (!r || !r.id) throw new Error("no id");
+    const link = location.origin + "/?share=" + r.id;
+    const ok = await copyText(link);
+    showToast(ok ? (ar ? "تم نسخ رابط المشاركة ✓" : "Share link copied ✓") : link);
+  } catch (e) {
+    showToast(ar ? "تعذّر إنشاء الرابط — احفظ المحادثة أولًا (أرسل رسالة) ثم أعد المحاولة" : "Couldn't create the link — try again after the chat is saved");
+  }
+}
+
+/* Public read-only viewer for /?share=<id> — no login needed. Renders with the SAME pipeline
+   as the app (markdown + KaTeX + instant plots/tikz), plus a CTA to try Firas AI. */
+async function checkShareLink() {
+  const id = new URLSearchParams(location.search).get("share");
+  if (!id) return false;
+  let snap = null;
+  try { snap = await apiJson("/api/share?id=" + encodeURIComponent(id)); } catch (_) {}
+  // inline display:none — the `hidden` attribute loses to class display rules in the cascade
+  [...document.body.children].forEach((c) => { if (c.tagName !== "SCRIPT" && c.tagName !== "STYLE") c.style.display = "none"; });
+  const wrap = document.createElement("div");
+  wrap.className = "share-page";
+  const arPage = snap && /[؀-ۿ]/.test((snap.title || "") + (snap.messages && snap.messages[0] ? snap.messages[0].content : ""));
+  wrap.dir = arPage ? "rtl" : "ltr";
+  const head = document.createElement("header");
+  head.className = "share-page__head";
+  head.innerHTML = '<div class="share-page__brand">Firas&nbsp;AI</div>' +
+    '<a class="share-page__cta" href="/">' + (arPage ? "جرّب فِراس مجانًا" : "Try Firas AI free") + "</a>";
+  wrap.appendChild(head);
+  const col = document.createElement("main");
+  col.className = "share-page__col";
+  if (!snap) {
+    col.innerHTML = '<p class="share-page__missing">' + (state.lang === "ar" ? "هذا الرابط غير موجود أو حُذف." : "This shared chat doesn't exist or was removed.") + "</p>";
+  } else {
+    if (snap.title) { const h = document.createElement("h1"); h.className = "share-page__title"; h.textContent = snap.title; col.appendChild(h); }
+    (snap.messages || []).forEach((m) => {
+      if (m.role === "user") {
+        const row = document.createElement("div"); row.className = "share-page__user";
+        const b = document.createElement("div"); b.className = "msg-user__bubble";
+        b.dir = (m.lang === "ar" || /[؀-ۿ]/.test(m.content || "")) ? "rtl" : "ltr";
+        if (Array.isArray(m.imageThumbs) && m.imageThumbs.length) {
+          const g = document.createElement("div"); g.className = "msg-user__images"; g.dir = "ltr";
+          m.imageThumbs.forEach((src) => { const im = document.createElement("img"); im.src = src; im.alt = ""; g.appendChild(im); });
+          b.appendChild(g);
+        }
+        if (m.content) { const tx = document.createElement("div"); tx.style.whiteSpace = "pre-wrap"; tx.textContent = m.content; b.appendChild(tx); typesetMath(tx); }
+        row.appendChild(b); col.appendChild(row);
+      } else {
+        const md = document.createElement("div"); md.className = "md share-page__ai";
+        md.dir = (m.lang === "ar" || /[؀-ۿ]/.test(m.content || "")) ? "rtl" : "ltr";
+        md.innerHTML = renderMarkdown(m.content || "");
+        decorateMarkdown(md); typesetMath(md);
+        col.appendChild(md);
+      }
+    });
+  }
+  wrap.appendChild(col);
+  document.body.appendChild(wrap);
+  document.title = (snap && snap.title) ? (snap.title + " — Firas AI") : "Firas AI";
+  return true;
+}
+
 async function init() {
   loadState();
   cacheEls();
@@ -7326,6 +8967,7 @@ async function init() {
   if (await checkVerifyLink()) return;
   if (checkResetLink()) return;
   if (await checkGoogleRedirect()) return;   // finish a Google sign-in that used the redirect fallback
+  if (await checkShareLink()) return;        // public read-only shared chat (/?share=<id>) — no login
 
   // Auth gate: ask the server who we are. A valid session skips the landing and
   // goes straight to the app; a logged-out visitor sees the polished landing

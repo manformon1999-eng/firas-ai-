@@ -136,9 +136,11 @@ const CF_IMAGE_STEPS = Math.min(20, Math.max(1, parseInt(process.env.CF_IMAGE_ST
 // gpt-oss accepts up to 131072; qwen3-coder caps at its model max (65536, which
 // still allows ~5000 lines and it does not spend tokens on thinking).
 const TIERS = {
-  mini:  { model: process.env.OLLAMA_MODEL_MINI  || "gpt-oss:120b-cloud", temperature: 0.5, num_predict: 16384 },
-  pro:   { model: process.env.OLLAMA_MODEL_PRO   || "gpt-oss:120b-cloud", temperature: 0.7, num_predict: 131072 },
-  ultra: { model: process.env.OLLAMA_MODEL_ULTRA || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536 },
+  // EVERY tier has a fallbackModel on a DIFFERENT hosted pool, so a busy primary degrades to a
+  // working model instead of surfacing "The Firas AI engine is busy".
+  mini:  { model: process.env.OLLAMA_MODEL_MINI  || "gpt-oss:120b-cloud", temperature: 0.5, num_predict: 16384,  fallbackModel: "qwen3-coder:480b-cloud" },
+  pro:   { model: process.env.OLLAMA_MODEL_PRO   || "gpt-oss:120b-cloud", temperature: 0.7, num_predict: 131072, fallbackModel: "qwen3-coder:480b-cloud" },
+  ultra: { model: process.env.OLLAMA_MODEL_ULTRA || "qwen3-coder:480b-cloud", temperature: 0.8, num_predict: 65536,  fallbackModel: "gpt-oss:120b-cloud" },
   // Max = strongest general/reasoning model (671B), gated by a per-user daily cap.
   // Env-overridable so the model swaps without a redeploy if Ollama's cloud catalog
   // rotates. fallbackModel degrades to a known-good hosted model (gpt-oss) before the
@@ -153,7 +155,7 @@ const OLLAMA_MODEL_VISION = process.env.OLLAMA_MODEL_VISION || "qwen2.5vl:7b";
 
 // Image caps: at most 6 images per request; skip any single image whose raw
 // base64 exceeds ~8MB. Larger JSON body cap (~25MB) applies to /api/chat only.
-const MAX_IMAGES_PER_REQUEST = 6;
+const MAX_IMAGES_PER_REQUEST = 10;
 const MAX_IMAGE_B64_BYTES = 8_000_000;
 const CHAT_BODY_LIMIT = 25_000_000;
 
@@ -327,6 +329,8 @@ function normalizeDb(parsed) {
     // Admin knowledge base (reference books for RAG grounding) — MUST persist across restarts.
     kb: arr(parsed && parsed.kb),
     pending: (parsed && parsed.pending && typeof parsed.pending === "object" && !Array.isArray(parsed.pending)) ? parsed.pending : {},
+    // Public share snapshots (read-only chat pages at /?share=<id>).
+    shares: (parsed && parsed.shares && typeof parsed.shares === "object" && !Array.isArray(parsed.shares)) ? parsed.shares : {},
     secret: parsed && typeof parsed.secret === "string" ? parsed.secret : "",
   };
 }
@@ -368,12 +372,16 @@ function persist() {
       if (fbEnabled()) { await fbSave(DB); return; }
       if (!existsSync(DATA_DIR)) await mkdir(DATA_DIR, { recursive: true });
       const tmp = DB_PATH + ".tmp";
-      await writeFile(tmp, JSON.stringify(DB, null, 2), "utf8");
+      // Pretty-print only while the DB is small; a big reference library would double every
+      // write (persist runs on each chat save) for no benefit.
+      const compact = JSON.stringify(DB);
+      const payload = compact.length > 2_000_000 ? compact : JSON.stringify(DB, null, 2);
+      await writeFile(tmp, payload, "utf8");
       try {
         const { rename } = await import("node:fs/promises");
         await rename(tmp, DB_PATH);
       } catch {
-        await writeFile(DB_PATH, JSON.stringify(DB, null, 2), "utf8");
+        await writeFile(DB_PATH, payload, "utf8");
       }
     } catch (e) {
       console.error("[firas] db write failed:", (e && e.message) || e);
@@ -1200,7 +1208,7 @@ async function handleListChats(req, res) {
   const list = userChats(user.id)
     .slice()
     .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))
-    .map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt, pinned: !!c.pinned }));
+    .map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt, pinned: !!c.pinned, agent: !!c.agent }));
   return sendJson(res, 200, list);
 }
 
@@ -1229,6 +1237,7 @@ async function handleCreateChat(req, res) {
     title: String(body.title ?? "New chat").slice(0, 200) || "New chat",
     messages: sanitizeMessages(body.messages),
     pinned: !!body.pinned,
+    agent: !!body.agent,   // Firas Agent chats live in their OWN sidebar list
     createdAt: now,
     updatedAt: now,
   };
@@ -1316,10 +1325,12 @@ async function streamOllama(res, messages, tier, think, signal, modelOverride) {
     options: { temperature: t.temperature, num_predict: t.num_predict },
   });
 
-  // Retry a transient failure ONCE before any bytes are streamed.
+  // Retry transient failures with REAL backoff before any bytes are streamed — a brief
+  // 429/503 on the hosted pool clears within a second or two.
   let upstream = null;
   let lastErr = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const OLLAMA_BACKOFF = [600, 1800];
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       upstream = await fetch(OLLAMA_CHAT_URL, {
         method: "POST",
@@ -1339,7 +1350,7 @@ async function streamOllama(res, messages, tier, think, signal, modelOverride) {
       lastErr = e;
       upstream = null;
     }
-    if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+    if (attempt < 2) await new Promise((r) => setTimeout(r, OLLAMA_BACKOFF[attempt]));
   }
 
   if (!upstream) {
@@ -2444,19 +2455,31 @@ function kbChunk(text) {
   if (buf.trim()) chunks.push(buf.trim());
   return chunks.filter((c) => c.length > 25).slice(0, 4000);
 }
+// Per-book token cache — kbTokens over every chunk of every book on EVERY chat request is
+// O(total library chars) of regex work; with any-size books that blocks the event loop for
+// hundreds of ms. Chunks are immutable after creation, so a WeakMap keyed by the book object
+// needs no invalidation (deleted books get GC'd out).
+const KB_TOK_CACHE = new WeakMap();
+function kbBookTokens(book) {
+  let toks = KB_TOK_CACHE.get(book);
+  if (!toks) { toks = (book.chunks || []).map((ch) => kbTokens(ch)); KB_TOK_CACHE.set(book, toks); }
+  return toks;
+}
 function kbSearch(query, maxChunks) {
   const qt = kbTokens(query);
   if (!qt.length) return [];
   const qset = new Set(qt);
   const scored = [];
   for (const book of kbList()) {
-    for (const ch of (book.chunks || [])) {
-      const ct = kbTokens(ch);
-      if (!ct.length) continue;
+    const chunks = book.chunks || [];
+    const toks = kbBookTokens(book);
+    for (let i = 0; i < chunks.length; i++) {
+      const ct = toks[i];
+      if (!ct || !ct.length) continue;
       let hits = 0; for (const t of ct) if (qset.has(t)) hits++;
       if (!hits) continue;
       const cov = (new Set(ct.filter((t) => qset.has(t)))).size / qset.size;
-      scored.push({ score: cov * 2 + hits / Math.sqrt(ct.length + 5), text: ch });
+      scored.push({ score: cov * 2 + hits / Math.sqrt(ct.length + 5), text: chunks[i] });
     }
   }
   scored.sort((a, b) => b.score - a.score);
@@ -2498,6 +2521,42 @@ async function handleKbDelete(req, res) {
   const list = kbList();
   const i = list.findIndex((b) => b.id === id);
   if (i >= 0) { list.splice(i, 1); await persist(); }
+  return sendJson(res, 200, { ok: true });
+}
+
+/* ── Public share links: snapshot a chat → read-only page at /?share=<id> ── */
+function sharesMap() { if (!DB.shares || typeof DB.shares !== "object") DB.shares = {}; return DB.shares; }
+async function handleShareCreate(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "auth required" });
+  let p; try { p = JSON.parse((await readBody(req)) || "{}"); } catch { return sendJson(res, 400, { error: "invalid JSON" }); }
+  const chat = DB.chats.find((c) => c.id === String(p.chatId || "") && c.userId === user.id);
+  if (!chat) return sendJson(res, 404, { error: "not found" });
+  const id = "s" + Date.now().toString(36) + crypto.randomBytes(5).toString("hex");
+  const msgs = (chat.messages || []).slice(0, 400).map((m) => {
+    const o = { role: m.role === "assistant" ? "assistant" : "user", content: String(m.content || "").slice(0, 200000) };
+    if (m.lang) o.lang = String(m.lang).slice(0, 8);
+    if (m.tier) o.tier = String(m.tier).slice(0, 16);
+    if (Array.isArray(m.imageThumbs) && m.imageThumbs.length) o.imageThumbs = m.imageThumbs.slice(0, 10).map((s) => String(s).slice(0, 200000));
+    return o;
+  });
+  sharesMap()[id] = { id, title: String(chat.title || "").slice(0, 200), messages: msgs, ts: Date.now(), owner: user.id };
+  await persist();
+  return sendJson(res, 200, { ok: true, id });
+}
+function handleShareGet(req, res) {   // PUBLIC — no auth by design
+  const id = String(new URL(req.url, "http://localhost").searchParams.get("id") || "").replace(/[^a-zA-Z0-9]/g, "");
+  const snap = id ? sharesMap()[id] : null;
+  if (!snap) return sendJson(res, 404, { error: "not found" });
+  return sendJson(res, 200, { id: snap.id, title: snap.title || "", messages: snap.messages || [], ts: snap.ts || 0 });
+}
+async function handleShareDelete(req, res) {
+  const user = currentUser(req);
+  if (!user) return sendJson(res, 401, { error: "auth required" });
+  const id = String(new URL(req.url, "http://localhost").searchParams.get("id") || "").replace(/[^a-zA-Z0-9]/g, "");
+  const snap = id ? sharesMap()[id] : null;
+  if (snap && snap.owner !== user.id && !isAdmin(user)) return sendJson(res, 403, { error: "not yours" });
+  if (snap) { delete sharesMap()[id]; await persist(); }
   return sendJson(res, 200, { ok: true });
 }
 
@@ -2609,13 +2668,16 @@ async function handleChat(req, res) {
         sseWrite(res, "The Firas AI vision engine is offline right now, so I can't view images. Please try again shortly.");
         sseDone(res);
       } else {
-        // For a capped tier (Max), first degrade to its known-good Ollama fallback
-        // model (gpt-oss) before the last-resort pollinations text fallback.
+        // RESCUE CHAIN for EVERY tier — never surface "busy" while any engine can answer:
+        // 1) the tier's Ollama fallback model (different hosted pool), 2) Gemini Flash (free),
+        // 3) OpenRouter free, 4) last-resort pollinations text fallback.
         const fb = TIERS[tier] && TIERS[tier].fallbackModel;
         let recovered = false;
         if (fb) recovered = await streamOllama(res, ollamaMessages, tier, think, ac.signal, fb);
+        if (!recovered && !res.writableEnded) recovered = await streamGemini(res, messages, ac.signal);
+        if (!recovered && !res.writableEnded) recovered = await streamOpenRouter(res, messages, ac.signal);
         if (!recovered && !res.writableEnded) {
-          // Ollama unreachable -> resilient TEXT fallback (no bytes streamed yet).
+          // Everything failed -> resilient TEXT fallback (no bytes streamed yet).
           await streamFallback(res, messages, tier, think, ac.signal);
         }
       }
@@ -2712,6 +2774,11 @@ const server = http.createServer(async (req, res) => {
     if (route === "/api/kb" && method === "GET") return await handleKbList(req, res);
     if (route === "/api/kb" && method === "POST") return await handleKbAdd(req, res);
     if (route === "/api/kb" && method === "DELETE") return await handleKbDelete(req, res);
+
+    // ---- Public share links ----
+    if (route === "/api/share" && method === "POST") return await handleShareCreate(req, res);
+    if (route === "/api/share" && method === "GET") return handleShareGet(req, res);
+    if (route === "/api/share" && method === "DELETE") return await handleShareDelete(req, res);
 
     // ---- Build version (lets an open tab auto-reload when code changes) ----
     if (route === "/api/version" && method === "GET") return handleVersion(req, res);
