@@ -4866,10 +4866,30 @@ function hexToRgb(hex) {
   return { r: parseInt(h.slice(0, 2), 16) || 0, g: parseInt(h.slice(2, 4), 16) || 0, b: parseInt(h.slice(4, 6), 16) || 0 };
 }
 
-async function exportPdf(turn, lang, msg) {
+async function exportPdf(turn, lang, msg, opts) {
+  opts = opts || {};
+  // ── INSTANT DOWNLOAD ── a background-warmed PDF for this message downloads with ZERO wait
+  // (the Agent's big documents used to make the user sit through the whole "Exporting…" render).
+  if (!opts.toBlob && msg) {
+    const ar0 = (lang || state.lang) === "ar";
+    if (msg._pdf && msg._pdf.blob) {
+      downloadBlob(msg._pdf.blob, msg._pdf.name);
+      showToast(ar0 ? "تم تنزيل الملف ✓" : "File downloaded ✓");
+      return;
+    }
+    if (msg._pdfWarm) {                       // warm-up already in flight → just wait for it
+      showToast(t().preparing);
+      const out = await msg._pdfWarm.catch(() => null);
+      if (out && out.blob) {
+        downloadBlob(out.blob, out.name);
+        showToast(ar0 ? "تم تنزيل الملف ✓" : "File downloaded ✓");
+        return;
+      }
+    }
+  }
   const { meta } = parseFileMeta(msg && msg.content);
   const mdNode = mdNodeForTurn(turn);
-  if (!mdNode || !mdNode.textContent.trim()) { showToast(t().exportEmpty); return; }
+  if (!mdNode || !mdNode.textContent.trim()) { if (!opts.quiet) showToast(t().exportEmpty); return null; }
   // Direction follows the CONTENT, not the UI language — an ENGLISH exam must render LTR even when the
   // user's language is Arabic. CRITICAL: count PROSE only — math (KaTeX) and code are full of Latin
   // (e^x, dx, sin, ln…) and a math-heavy ARABIC doc was mis-detected as English → wrong (Latin) font
@@ -4888,8 +4908,8 @@ async function exportPdf(turn, lang, msg) {
   const fileTitle = String(meta.filename || meta.title || (activeChat() && activeChat().title) || "Firas AI")
     .replace(/\$+/g, "").replace(/\\[a-zA-Z]+/g, "").replace(/[{}\\^_]/g, "")
     .replace(/[\\/:*?"<>|\n\r]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 90) || "Firas AI";
-  document.title = fileTitle;
-  if (mdNode.querySelector(".tikz-figure[data-tikz-pending]")) showToast(isAr ? "يُحضّر الرسوم قبل الحفظ…" : "Rendering figures…");
+  if (!opts.quiet) document.title = fileTitle;
+  if (!opts.quiet && mdNode.querySelector(".tikz-figure[data-tikz-pending]")) showToast(isAr ? "يُحضّر الرسوم قبل الحفظ…" : "Rendering figures…");
   await tikzReady(4000);                       // in-house figures settle fast; engine (TikZJax) figures are stripped from the PDF
   const { cover, body } = exportBody(mdNode, lang, meta);
 
@@ -4919,7 +4939,7 @@ async function exportPdf(turn, lang, msg) {
   }
   document.body.appendChild(root);
 
-  showToast(t().preparing);
+  if (!opts.quiet) showToast(t().preparing);
   await ensureExportFonts(isAr);                  // professional fonts ready first
   await tikzReady(4000);                         // in-house plot/mini-tikz settle (engine figures are stripped)
   await new Promise((r) => setTimeout(r, isAr ? 320 : 160));   // Arabic needs a touch more to paint shaped glyphs before capture
@@ -5011,7 +5031,7 @@ async function exportPdf(turn, lang, msg) {
     const closePage = () => { stampNo(); pdf.addPage(); pageNo++; usedMm = 0; };
     for (let ci = 0; ci < chunks.length; ci++) {
       const ch = chunks[ci];
-      if (chunks.length > 4) showToast((isAr ? "يُصدّر الكتاب… " : "Exporting… ") + Math.round((ci / chunks.length) * 100) + "%");
+      if (!opts.quiet && chunks.length > 4) showToast((isAr ? "يُصدّر الكتاب… " : "Exporting… ") + Math.round((ci / chunks.length) * 100) + "%");
       const cr = document.createElement("div");
       cr.id = "firasExportChunk";
       cr.setAttribute("dir", root.getAttribute("dir") || "rtl");
@@ -5098,13 +5118,48 @@ async function exportPdf(turn, lang, msg) {
     }
     if (!anyPage) throw new Error("blank capture");
     stampNo();                                                        // number the final page
+    if (opts.toBlob) {                                                // background warm-up → hand back the blob
+      const blob = pdf.output("blob");
+      cleanup();
+      return { blob, name: fileTitle + ".pdf" };
+    }
     pdf.save(fileTitle + ".pdf");
     cleanup();
     showToast(isAr ? "تم تنزيل الملف ✓" : "File downloaded ✓");
   } catch (_) {
     cleanup();
+    if (opts.quiet) return null;                                      // silent warm-up failure → click falls back to a live export
     showToast(t().formatUnavailable || (isAr ? "تعذّر إنشاء الملف" : "Couldn't create the file"));
   }
+  return null;
+}
+
+/* ── PDF WARM CACHE ── pre-render a freshly-delivered file's PDF in the BACKGROUND so clicking
+   "تحميل" hands the file over INSTANTLY (no "Exporting…" wait) — Agent docs especially are big.
+   In-memory only (serializeMessages never persists _pdf/_pdfWarm); capped so blobs don't pile up. */
+const _pdfWarmed = [];
+const PDF_WARM_CAP = 3;
+function warmPdfCache(chat, idx, delay) {
+  setTimeout(async () => {
+    try {
+      if (!chat || chat !== activeChat()) return;                      // switched chats → its turn isn't in the DOM
+      const msg = chat.messages[idx];
+      if (!msg || msg.role !== "assistant" || msg._pdf || msg._pdfWarm) return;
+      // Only when this message actually carries a PDF file card (docx/xlsx cards export differently).
+      const fmt = typeof requestedFormatForAssistant === "function" ? requestedFormatForAssistant(chat, idx) : null;
+      if (fmt !== "pdf") return;
+      const turn = els.thread.querySelector(`.msg-ai[data-index="${idx}"]`);
+      if (!turn) return;
+      msg._pdfWarm = exportPdf(turn, msg.lang || state.lang, msg, { toBlob: true, quiet: true });
+      const out = await msg._pdfWarm.catch(() => null);
+      msg._pdfWarm = null;
+      if (out && out.blob) {
+        msg._pdf = out;
+        _pdfWarmed.push(msg);
+        if (_pdfWarmed.length > PDF_WARM_CAP) { const old = _pdfWarmed.shift(); if (old && old !== msg) old._pdf = null; }
+      }
+    } catch (_) {}
+  }, delay || 1800);
 }
 
 async function exportWord(turn, lang, msg) {
@@ -7908,6 +7963,7 @@ async function streamAnswer(aiMsg, aiNode, chat, convoOverride) {
       aiMsg.content = finalDoc;
       aiMsg.reasoning = "";
       finalizeAi(aiMsg, chat);
+      warmPdfCache(chat, chat.messages.indexOf(aiMsg), 1800);   // background-render the PDF → instant download
       return; // the `finally` still runs (stream cleanup)
     }
 
@@ -11367,6 +11423,9 @@ async function runAgentAssistant(chat, tier, replyLang, resumeRun) {
         } else {
           const finalDoc = metaBlockString(meta) + "\n\n" + body;
           chat.messages.push({ role: "assistant", content: finalDoc, reasoning: "", tier, lang: replyLang, mode: state.mode });
+          // Background-render this doc's PDF now so the download click is INSTANT (like normal Firas AI).
+          // (Multi-volume mega books are skipped — warming several huge renders would jank the page.)
+          warmPdfCache(chat, chat.messages.length - 1, 2200);
         }
       }
       // ⑤ LEARN — a completed mission teaches durable preferences (topic, language, style) for
