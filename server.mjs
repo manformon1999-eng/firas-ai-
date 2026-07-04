@@ -42,13 +42,38 @@ const FALLBACK_URL = "https://text.pollinations.ai/openai"; // keyless, server-s
 const FALLBACK_MODEL = "openai";
 const UPSTREAM_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 300_000; // 5 min — long code/full websites need room to finish
 
-// Optional Ollama API key. Set this (+ OLLAMA_HOST=https://ollama.com) to use
-// Ollama's HOSTED cloud API from a deployed server that has NO local Ollama —
-// so the app works online, not just on a machine running the Ollama daemon.
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
-function ollamaHeaders() {
+// Ollama API KEY POOL. Set OLLAMA_API_KEY (+ OLLAMA_HOST=https://ollama.com) to use Ollama's
+// HOSTED cloud API. Each free key has a WEEKLY quota — when one key hits its limit (429/402/403)
+// the pool moves to the NEXT key automatically. Add extra keys via OLLAMA_API_KEYS="k2,k3,…"
+// or numbered OLLAMA_API_KEY_1..OLLAMA_API_KEY_9. Picking is STICKY-FIRST (drain key 1, then
+// key 2…) so quotas are consumed one at a time, not all at once.
+const OLLAMA_KEYS = (() => {
+  const keys = [];
+  if (process.env.OLLAMA_API_KEY) keys.push(process.env.OLLAMA_API_KEY.trim());
+  for (const k of (process.env.OLLAMA_API_KEYS || "").split(",")) { const v = k.trim(); if (v) keys.push(v); }
+  for (let i = 1; i <= 9; i++) { const v = (process.env["OLLAMA_API_KEY_" + i] || "").trim(); if (v) keys.push(v); }
+  return [...new Set(keys)];
+})();
+const OLLAMA_API_KEY = OLLAMA_KEYS[0] || "";                  // back-compat (startup logs / host default)
+const _olCooldown = new Map();                                 // key → ms timestamp it may be retried
+// A limited key rests 45 min (limits reset weekly, but a periodic re-probe self-heals sooner
+// if the quota was actually a transient 429).
+function ollamaMarkLimited(key, status) {
+  if (!key) return;
+  _olCooldown.set(key, Date.now() + 45 * 60_000);
+  console.warn("[firas] ollama key …" + key.slice(-6) + " limited (HTTP " + status + ") — rotating to the next key (" + OLLAMA_KEYS.filter((k) => Date.now() >= (_olCooldown.get(k) || 0)).length + " usable)");
+}
+// First key not on cooldown; if ALL are cooling, the one that recovers soonest (never give up).
+function ollamaPickKey() {
+  if (!OLLAMA_KEYS.length) return "";
+  const now = Date.now();
+  for (const k of OLLAMA_KEYS) { if (now >= (_olCooldown.get(k) || 0)) return k; }
+  return OLLAMA_KEYS.reduce((a, b) => ((_olCooldown.get(a) || 0) <= (_olCooldown.get(b) || 0) ? a : b));
+}
+function ollamaHeaders(key) {
   const h = { "Content-Type": "application/json" };
-  if (OLLAMA_API_KEY) h["Authorization"] = "Bearer " + OLLAMA_API_KEY;
+  const k = key !== undefined ? key : ollamaPickKey();
+  if (k) h["Authorization"] = "Bearer " + k;
   return h;
 }
 
@@ -120,6 +145,25 @@ const CF_API_TOKEN   = process.env.CF_API_TOKEN || "";
 // (~130/day, weak text). Premium-but-pricey: @cf/leonardo/lucid-origin (~4/day).
 const CF_IMAGE_MODEL = process.env.CF_IMAGE_MODEL || "@cf/black-forest-labs/flux-2-klein-9b";
 const CF_IMAGE_STEPS = Math.min(20, Math.max(1, parseInt(process.env.CF_IMAGE_STEPS || "10", 10) || 10)); // flux-2 (no per-step cost) uses this; flux-schnell clamped to 8 in the request
+// Cloudflare Workers AI TEXT model — a REAL free engine (10k neurons/day) that works from any country
+// (Iraq included), so it rescues chat when the Gemini/OpenRouter free tiers are 429-exhausted.
+const CF_TEXT_MODEL = process.env.CF_TEXT_MODEL || "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// STRONG Cloudflare model for HARD tasks (Max tier / math / science / exam generation): a free
+// Workers-AI REASONING model (emits <think>…</think> chains) — far more CORRECT on Olympiad/JEE-grade
+// problems than the fast llama fallback. Used only on the hard path so normal chat stays fast; if it's
+// unavailable the rescue chain simply degrades to the next engine. Its <think> is stripped before the
+// answer is streamed (see streamCloudflareText). Override with CF_TEXT_MODEL_STRONG.
+const CF_TEXT_MODEL_STRONG = process.env.CF_TEXT_MODEL_STRONG || "@cf/qwen/qwq-32b";
+// Detect a genuinely hard prompt (math/science/exam) so it's routed to the reasoning model even on
+// lower tiers. Keeps the fast model for everyday chat.
+const CF_HARD_RE = /امتحان|اختبار|أسئلة|اسئلة|بنك\s*أسئلة|واجب|مسألة|مسائل|احسب|أثبت|برهن|اشتقاق|تكامل|تفاضل|معادل|هندسة|نظرية|رياضيات|جبر|فيزياء|كيمياء|quiz|exam|worksheet|\bmcq\b|olympiad|putnam|\bproof\b|theorem|integral|derivative|calculus|algebra|geometry|equation|\bmath\b|physics|chem|\bsolve\b|∫|√|∑|[0-9]\s*[+\-*/^=]\s*[0-9a-zA-Z]/i;
+function cfLastUserText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && m.role === "user") return typeof m.content === "string" ? m.content : (Array.isArray(m.content) ? m.content.map((p) => (p && p.text) || "").join(" ") : "");
+  }
+  return "";
+}
 
 // Tier -> Ollama model + generation params (env-overridable).
 // num_predict = MAX output tokens. Generous so long outputs (a full single-file
@@ -1328,34 +1372,44 @@ async function streamOllama(res, messages, tier, think, signal, modelOverride) {
   });
 
   // Retry transient failures with REAL backoff before any bytes are streamed — a brief
-  // 429/503 on the hosted pool clears within a second or two.
+  // 429/503 on the hosted pool clears within a second or two. A QUOTA hit (429/402/403 on a
+  // hosted key) marks that key limited and jumps IMMEDIATELY to the next key in the pool.
   let upstream = null;
   let lastErr = null;
   let was429 = false;
   const OLLAMA_BACKOFF = [400, 900];
   const OLLAMA_BACKOFF_429 = [1200, 2500];   // FAST-FAIL: abandon a saturated pool in ~2.5s so a fast provider answers
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const attemptsMax = Math.max(2, OLLAMA_KEYS.length + 1);
+  for (let attempt = 0; attempt < attemptsMax; attempt++) {
+    const olKey = ollamaPickKey();
     try {
       upstream = await fetch(OLLAMA_CHAT_URL, {
         method: "POST",
-        headers: ollamaHeaders(),
+        headers: ollamaHeaders(olKey),
         body,
         signal,
       });
       if (upstream.ok && upstream.body) break;
-      was429 = (upstream.status === 429);   // reset each attempt so a 429→503 sequence doesn't over-wait
-      lastErr = new Error("ollama " + upstream.status);
+      const st = upstream.status;
+      was429 = (st === 429);   // reset each attempt so a 429→503 sequence doesn't over-wait
+      lastErr = new Error("ollama " + st);
       upstream = null;
+      if (olKey && (st === 429 || st === 402 || st === 403)) {
+        ollamaMarkLimited(olKey, st);
+        // a FRESH key is available → rotate to it immediately, no backoff wasted
+        if (OLLAMA_KEYS.some((k) => k !== olKey && Date.now() >= (_olCooldown.get(k) || 0))) continue;
+        // NO healthy key left → bail out NOW (no pointless backoff+retry on dead keys) so the
+        // caller's rescue chain (Gemini → Cloudflare → OpenRouter → pollinations) answers fast.
+        break;
+      }
       // a non-OK HTTP status from Ollama itself is not a "connect" failure;
-      // retry once then give up (do NOT fall back to pollinations on a real
-      // model error vs. connection error — but to keep the app working we let
-      // the caller decide; here we signal unreachable only on fetch throw).
+      // retry then give up — the caller decides the fallback.
     } catch (e) {
       if (signal.aborted) return true; // client gone; nothing to do
       lastErr = e;
       upstream = null;
     }
-    if (attempt < 1) await new Promise((r) => setTimeout(r, (was429 ? OLLAMA_BACKOFF_429 : OLLAMA_BACKOFF)[attempt]));
+    if (attempt < attemptsMax - 1) await new Promise((r) => setTimeout(r, (was429 ? OLLAMA_BACKOFF_429 : OLLAMA_BACKOFF)[Math.min(attempt, 1)]));
   }
 
   if (!upstream) {
@@ -2291,6 +2345,85 @@ async function streamOpenRouter(res, messages, signal) {
   } catch (e) { return signal.aborted ? true : any; }
 }
 
+/* Cloudflare Workers AI TEXT — free (10k neurons/day), works from any country. Rotates through the
+   same CF accounts used for images (429 cooldown aware). Returns true if it streamed any bytes. */
+// A streaming <think>…</think> stripper for reasoning models (qwq / deepseek-r1): they emit their
+// chain-of-thought in the SAME response field as the answer. Suppress everything up to and including
+// </think>, then forward only the real answer. Safe on non-reasoning output too (auto-flushes if no
+// <think> opens). Returns the visible text to forward for a given token (or "").
+function makeThinkStripper() {
+  let done = false, inside = false, buf = "", seen = 0;
+  return {
+    push(tok) {
+      if (done) return tok;
+      buf += tok; seen += tok.length;
+      if (!inside && buf.indexOf("<think>") !== -1) inside = true;
+      const close = buf.indexOf("</think>");
+      if (close !== -1) { done = true; const after = buf.slice(close + 8); buf = ""; return after; }
+      if (inside) { if (buf.length > 24) buf = buf.slice(-24); return ""; }   // discard think body, keep tail for a split tag
+      if (seen > 240) { done = true; const out = buf; buf = ""; return out; }  // no <think> appeared → not a reasoning stream
+      return "";                                                               // still buffering the opening chars
+    },
+    // Stream ended: flush any buffered NON-think content (a short answer under 240 chars with no tag).
+    // If we were still inside an unclosed <think> (truncated reasoning), discard it → caller falls through.
+    flush() { if (done || inside) { done = true; return ""; } const out = buf; buf = ""; done = true; return out; },
+  };
+}
+async function streamCloudflareText(res, messages, signal, model, maxTokens) {
+  if (!CF_ACCOUNTS.length) return false;
+  const useModel = model || CF_TEXT_MODEL;
+  const strip = useModel !== CF_TEXT_MODEL;                 // strong/reasoning path → strip <think>
+  const cap = maxTokens || (strip ? 8192 : 4096);           // reasoning needs room for think + answer
+  const msgs = messages.filter((m) => m.role === "system" || m.role === "user" || m.role === "assistant")
+    .map((m) => ({ role: m.role, content: String(m.content || "") }));
+  if (!msgs.length) return false;
+  for (let k = 0; k < CF_ACCOUNTS.length; k++) {
+    if (res.writableEnded) return true;
+    const acct = CF_ACCOUNTS[(_cfNext + k) % CF_ACCOUNTS.length];
+    if (Date.now() < (_cfCooldown.get("txt:" + acct.id) || 0)) continue;   // separate cooldown for text
+    let upstream;
+    try {
+      upstream = await fetch("https://api.cloudflare.com/client/v4/accounts/" + acct.id + "/ai/run/" + useModel, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + acct.token },
+        body: JSON.stringify({ messages: msgs, stream: true, max_tokens: cap }),
+        signal,
+      });
+    } catch (e) { if (signal.aborted) return true; continue; }
+    if (!upstream.ok || !upstream.body) {
+      if (upstream && upstream.status === 429) _cfCooldown.set("txt:" + acct.id, Date.now() + 20 * 60_000);
+      console.error("[firas] CF text (" + acct.id.slice(0, 6) + ") HTTP " + (upstream && upstream.status) + " — next");
+      try { upstream && upstream.body && upstream.body.cancel(); } catch (_) {}
+      continue;
+    }
+    const decoder = new TextDecoder();
+    let buffer = "", any = false;
+    const strip_ = strip ? makeThinkStripper() : null;
+    try {
+      for await (const chunk of upstream.body) {
+        if (res.writableEnded) break;
+        buffer += decoder.decode(chunk, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf("\n")) !== -1) {
+          let line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (!payload || payload === "[DONE]") continue;
+          let evt; try { evt = JSON.parse(payload); } catch { continue; }   // CF: {"response":"token"}
+          if (evt && typeof evt.response === "string" && evt.response) {
+            const out = strip_ ? strip_.push(evt.response) : evt.response;
+            if (out) { sseWrite(res, out); any = true; }
+          }
+        }
+      }
+      if (strip_) { const tail = strip_.flush(); if (tail) { sseWrite(res, tail); any = true; } }
+      if (any) { _cfNext = (_cfNext + k + 1) % CF_ACCOUNTS.length; return true; }
+    } catch (e) { if (signal.aborted) return true; }
+  }
+  return false;
+}
+
 async function streamFallback(res, messages, tier, think, signal) {
   const body = JSON.stringify({ model: FALLBACK_MODEL, messages, stream: true });
   let upstream;
@@ -2381,19 +2514,26 @@ async function llmComplete(messages, opts) {
   const temp = opts.temperature != null ? opts.temperature : 0;
   // 1) Ollama (strong, accurate) — gpt-oss reasoning model. num_predict must be large
   // enough that thinking + the JSON answer both fit, or .content comes back empty.
-  try {
-    const r = await fetch(OLLAMA_CHAT_URL, {
-      method: "POST",
-      headers: ollamaHeaders(),
-      body: JSON.stringify({ model: (TIERS.pro && TIERS.pro.model) || "gpt-oss:120b-cloud", messages, stream: false, options: { temperature: temp, num_predict: tok } }),
-      signal: opts.signal,
-    });
-    if (r.ok) {
-      const j = await r.json().catch(() => null);
-      const c = j && j.message && j.message.content;
-      if (typeof c === "string" && c.trim()) return c;
-    }
-  } catch (_) {}
+  // Rotates to the next pool key when one is quota-limited (429/402/403).
+  for (let a = 0; a < Math.max(1, Math.min(3, OLLAMA_KEYS.length || 1)); a++) {
+    const olKey = ollamaPickKey();
+    try {
+      const r = await fetch(OLLAMA_CHAT_URL, {
+        method: "POST",
+        headers: ollamaHeaders(olKey),
+        body: JSON.stringify({ model: (TIERS.pro && TIERS.pro.model) || "gpt-oss:120b-cloud", messages, stream: false, options: { temperature: temp, num_predict: tok } }),
+        signal: opts.signal,
+      });
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        const c = j && j.message && j.message.content;
+        if (typeof c === "string" && c.trim()) return c;
+        break;                                              // OK but empty → don't burn more keys
+      }
+      if (olKey && (r.status === 429 || r.status === 402 || r.status === 403)) { ollamaMarkLimited(olKey, r.status); continue; }
+      break;                                                // non-quota error → fall through to pollinations
+    } catch (_) { break; }
+  }
   // 2) Keyless pollinations fallback.
   try {
     const r = await fetch(FALLBACK_URL, {
@@ -2787,14 +2927,23 @@ async function handleChat(req, res) {
         // RESCUE CHAIN for EVERY tier — never surface "busy" while any engine can answer:
         // 1) the tier's Ollama fallback model (different hosted pool), 2) Gemini Flash (free),
         // 3) OpenRouter free, 4) last-resort pollinations text fallback.
+        // FAST rescue: Gemini (fast, good) → Cloudflare (fast ~0.5s, free, ANY country, real capacity)
+        // → OpenRouter → the slow Ollama fallback pool → keyless pollinations. CF is high so a
+        // 429-storm on the other free tiers doesn't crawl through slow pools before answering.
         const fb = TIERS[tier] && TIERS[tier].fallbackModel;
-        let recovered = false;
-        if (fb) recovered = await streamOllama(res, ollamaMessages, tier, think, ac.signal, fb);
-        if (!recovered && !res.writableEnded) recovered = await streamGemini(res, messages, ac.signal);
+        // HARD tasks (Max tier / math / science / exam) → Cloudflare REASONING model for correctness;
+        // everyday chat stays on the fast model. (Agent always runs tier "max" → always the strong model.)
+        const cfHard = tier === "max" || CF_HARD_RE.test(cfLastUserText(messages));
+        const cfModel = cfHard ? CF_TEXT_MODEL_STRONG : CF_TEXT_MODEL;
+        let recovered = await streamGemini(res, messages, ac.signal);
+        if (!recovered && !res.writableEnded) recovered = await streamCloudflareText(res, messages, ac.signal, cfModel);
+        // If the strong reasoning model produced nothing (e.g. truncated mid-think / unavailable), retry
+        // the fast model so we still answer rather than falling straight through.
+        if (!recovered && !res.writableEnded && cfModel !== CF_TEXT_MODEL) recovered = await streamCloudflareText(res, messages, ac.signal, CF_TEXT_MODEL);
         if (!recovered && !res.writableEnded) recovered = await streamOpenRouter(res, messages, ac.signal);
+        if (!recovered && !res.writableEnded && fb) recovered = await streamOllama(res, ollamaMessages, tier, think, ac.signal, fb);
         if (!recovered && !res.writableEnded) {
-          // Everything failed -> resilient TEXT fallback (no bytes streamed yet).
-          await streamFallback(res, messages, tier, think, ac.signal);
+          await streamFallback(res, messages, tier, think, ac.signal);   // last-resort keyless pollinations
         }
       }
     }

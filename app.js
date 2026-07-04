@@ -2082,10 +2082,21 @@ function compilePlotExpr(src) {
   const VAR = (arguments[1] || "x").toLowerCase();   // free variable: x (default), theta (polar), t (parametric)
   let s = String(src).replace(/\s+/g, "").toLowerCase();
   if (!s) return null;
-  s = s.replace(/\*\*/g, "^").replace(/(\d)([a-z(])/g, "$1*$2").replace(/\)([a-z(\d.])/g, ")*$1").replace(new RegExp(VAR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "([a-z(])", "g"), VAR + "*$1");
+  // Only normalize the power operator; implicit multiplication (2x, x(x+1), 2sin(x), )( …) is handled
+  // in the parser below — a regex that inserts `*` around the variable would corrupt function names
+  // that CONTAIN the variable letter (exp→ex*p, and for t: tan/sqrt/atan…), breaking those graphs.
+  s = s.replace(/\*\*/g, "^");
   let i = 0;
   function expr() { let a = term(); while (s[i] === "+" || s[i] === "-") { const o = s[i++], b = term(), A = a, B = b; a = o === "+" ? (x) => A(x) + B(x) : (x) => A(x) - B(x); } return a; }
-  function term() { let a = unary(); while (s[i] === "*" || s[i] === "/") { const o = s[i++], b = unary(), A = a, B = b; a = o === "*" ? (x) => A(x) * B(x) : (x) => A(x) / B(x); } return a; }
+  function term() {
+    let a = unary();
+    while (i < s.length) {
+      if (s[i] === "*" || s[i] === "/") { const o = s[i++], b = unary(), A = a, B = b; a = o === "*" ? (x) => A(x) * B(x) : (x) => A(x) / B(x); }
+      else if (/[0-9.a-z(]/.test(s[i])) { const b = unary(), A = a, B = b; a = (x) => A(x) * B(x); }   // implicit multiplication
+      else break;
+    }
+    return a;
+  }
   function unary() { if (s[i] === "-") { i++; const A = unary(); return (x) => -A(x); } if (s[i] === "+") { i++; return unary(); } return power(); }
   function power() { const a = atom(); if (s[i] === "^") { i++; const b = unary(), A = a, B = b; return (x) => Math.pow(A(x), B(x)); } return a; }
   function atom() {
@@ -2104,6 +2115,121 @@ function compilePlotExpr(src) {
   }
   try { const fn = expr(); if (i !== s.length) return null; const v = fn(0.5); if (typeof v !== "number") return null; return fn; }
   catch (_) { return null; }
+}
+
+/* Compile a TWO-variable expression z = f(x,y) → (x,y)=>value. Powers the 3D surface plot. */
+function compilePlot2(src) {
+  const F = { sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos, atan: Math.atan,
+    arcsin: Math.asin, arccos: Math.acos, arctan: Math.atan, sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh,
+    exp: Math.exp, ln: Math.log, log: (v) => Math.log(v) / Math.LN10, log2: (v) => Math.log(v) / Math.LN2,
+    sqrt: Math.sqrt, cbrt: Math.cbrt, abs: Math.abs, sign: Math.sign, floor: Math.floor, ceil: Math.ceil, round: Math.round };
+  const C = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI };
+  let s = String(src).replace(/\s+/g, "").toLowerCase();
+  if (!s) return null;
+  s = s.replace(/\*\*/g, "^");   // implicit multiplication handled in the parser (regex would corrupt exp/max…)
+  let i = 0;
+  function expr() { let a = term(); while (s[i] === "+" || s[i] === "-") { const o = s[i++], b = term(), A = a, B = b; a = o === "+" ? (x, y) => A(x, y) + B(x, y) : (x, y) => A(x, y) - B(x, y); } return a; }
+  function term() {
+    let a = unary();
+    while (i < s.length) {
+      if (s[i] === "*" || s[i] === "/") { const o = s[i++], b = unary(), A = a, B = b; a = o === "*" ? (x, y) => A(x, y) * B(x, y) : (x, y) => A(x, y) / B(x, y); }
+      else if (/[0-9.a-z(]/.test(s[i])) { const b = unary(), A = a, B = b; a = (x, y) => A(x, y) * B(x, y); }   // implicit multiplication
+      else break;
+    }
+    return a;
+  }
+  function unary() { if (s[i] === "-") { i++; const A = unary(); return (x, y) => -A(x, y); } if (s[i] === "+") { i++; return unary(); } return power(); }
+  function power() { const a = atom(); if (s[i] === "^") { i++; const b = unary(), A = a, B = b; return (x, y) => Math.pow(A(x, y), B(x, y)); } return a; }
+  function atom() {
+    if (s[i] === "(") { i++; const e = expr(); if (s[i] !== ")") throw 0; i++; return e; }
+    let m = /^[0-9]*\.?[0-9]+/.exec(s.slice(i));
+    if (m) { i += m[0].length; const v = parseFloat(m[0]); return () => v; }
+    m = /^[a-z_][a-z0-9_]*/.exec(s.slice(i));
+    if (m) { const n = m[0]; i += n.length;
+      if (n === "x") return (x) => x;
+      if (n === "y") return (x, y) => y;
+      if (Object.prototype.hasOwnProperty.call(C, n)) { const v = C[n]; return () => v; }
+      if (Object.prototype.hasOwnProperty.call(F, n)) { if (s[i] !== "(") throw 0; i++; const a = expr(); if (s[i] !== ")") throw 0; i++; const f = F[n], A = a; return (x, y) => f(A(x, y)); }
+      throw 0;
+    }
+    throw 0;
+  }
+  try { const fn = expr(); if (i !== s.length) return null; const v = fn(0.4, 0.6); if (typeof v !== "number") return null; return fn; }
+  catch (_) { return null; }
+}
+
+/* Render a 3D SURFACE z=f(x,y) as an isometric wireframe SVG — height-shaded quads, painter's
+   depth sort, clean look. Self-contained (no engine) so it renders in chat AND PDF. */
+function plot3dSurfaceSvg(fn, xr, yr, label, view) {
+  view = view || {};
+  const az = view.az != null ? view.az : -0.85, el = view.el != null ? view.el : 0.52, zoom = view.zoom || 1;
+  const [x0, x1] = xr, [y0, y1] = yr, N = 34;
+  const P = []; let zmin = Infinity, zmax = -Infinity;
+  for (let i = 0; i <= N; i++) { P[i] = []; for (let j = 0; j <= N; j++) { const x = x0 + (x1 - x0) * i / N, y = y0 + (y1 - y0) * j / N; let z; try { z = fn(x, y); } catch (_) { z = NaN; } if (!isFinite(z)) z = NaN; P[i][j] = { x, y, z }; if (isFinite(z)) { if (z < zmin) zmin = z; if (z > zmax) zmax = z; } } }
+  if (!isFinite(zmin)) { zmin = -1; zmax = 1; }
+  const zc = (zmax - zmin) || 1, span = Math.max(x1 - x0, y1 - y0) || 1;
+  const zEx = span / zc * 0.5;                                    // exaggerate z into world (xy) units
+  const W = 480, H = 360, cx = W / 2, cy = H * 0.54;
+  const scale = Math.min(W, H) * 0.34 / span * zoom;
+  const mx = (x0 + x1) / 2, my = (y0 + y1) / 2, mz = (zmin + zmax) / 2;
+  const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+  const world = (x, y, z) => [x - mx, y - my, ((isFinite(z) ? z : mz) - mz) * zEx];
+  // Rotate about z (azimuth) then about screen-x (elevation). Returns [screenX, screenY, depth].
+  const proj = (w) => { const x1r = w[0] * ca - w[1] * sa, y1r = w[0] * sa + w[1] * ca, z1 = w[2]; const y2 = y1r * ce - z1 * se, z2 = y1r * se + z1 * ce; return [cx + x1r * scale, cy - z2 * scale, y2]; };
+  const rot = (v) => { const x1r = v[0] * ca - v[1] * sa, y1r = v[0] * sa + v[1] * ca, z1 = v[2]; return [x1r, y1r * ce - z1 * se, y1r * se + z1 * ce]; };
+  const L = [-0.32, -0.5, 0.8], LL = Math.hypot(L[0], L[1], L[2]); L[0] /= LL; L[1] /= LL; L[2] /= LL;
+  const col = (z, shade) => { const t = isFinite(z) ? Math.max(0, Math.min(1, (z - zmin) / zc)) : 0.5; let r = 48 + t * 210, g = 46 + t * 150, b = 130 - t * 80; r *= shade; g *= shade; b *= shade; return "rgb(" + Math.round(Math.min(255, r)) + "," + Math.round(Math.min(255, g)) + "," + Math.round(Math.min(255, b)) + ")"; };
+  const quads = [];
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const a00 = P[i][j], a10 = P[i + 1][j], a11 = P[i + 1][j + 1], a01 = P[i][j + 1];
+    if (![a00, a10, a11, a01].every((p) => isFinite(p.z))) continue;
+    const w00 = world(a00.x, a00.y, a00.z), w10 = world(a10.x, a10.y, a10.z), w11 = world(a11.x, a11.y, a11.z), w01 = world(a01.x, a01.y, a01.z);
+    const ux = w11[0] - w00[0], uy = w11[1] - w00[1], uz = w11[2] - w00[2], vx = w01[0] - w10[0], vy = w01[1] - w10[1], vz = w01[2] - w10[2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx; const nl = Math.hypot(nx, ny, nz) || 1;
+    const rn = rot([nx / nl, ny / nl, nz / nl]); let dot = Math.abs(rn[0] * L[0] + rn[1] * L[1] + rn[2] * L[2]);
+    const shade = 0.52 + 0.48 * dot, zAvg = (a00.z + a10.z + a11.z + a01.z) / 4;
+    const p00 = proj(w00), p10 = proj(w10), p11 = proj(w11), p01 = proj(w01);
+    const depth = (p00[2] + p10[2] + p11[2] + p01[2]) / 4;
+    quads.push({ depth, d: "M" + [p00, p10, p11, p01].map((p) => p[0].toFixed(1) + " " + p[1].toFixed(1)).join("L") + "Z", fill: col(zAvg, shade) });
+  }
+  quads.sort((p, q) => q.depth - p.depth);                        // painter's: farthest first
+  const faces = quads.map((q) => '<path d="' + q.d + '" fill="' + q.fill + '" stroke="#ffffff" stroke-width="0.3" stroke-opacity="0.35"/>').join("");
+  return '<svg viewBox="0 0 ' + W + " " + H + '" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="3D surface" style="width:100%;height:auto;display:block">' +
+    '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="var(--plot-bg,#faf9f5)" rx="8"/>' + faces + "</svg>";
+}
+
+/* Make a 3D surface figure drag-rotatable + wheel/pinch-zoomable. Re-renders on each frame. */
+function make3dInteractive(fig, fn, xr, yr, label) {
+  const st = { az: -0.85, el: 0.52, zoom: 1 }, home = Object.assign({}, st);
+  let raf = 0;
+  const draw = () => { raf = 0; const tmp = document.createElement("div"); tmp.innerHTML = plot3dSurfaceSvg(fn, xr, yr, label, st); const ns = tmp.firstElementChild, old = fig.querySelector("svg"); if (ns && old) fig.replaceChild(ns, old); };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(draw); };
+  fig.style.touchAction = "none";
+  const pts = new Map(); let drag = null, pinch = null;
+  fig.addEventListener("pointerdown", (e) => {
+    if (e.target.closest && e.target.closest(".plot-reset")) return;
+    try { fig.setPointerCapture(e.pointerId); } catch (_) {}
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pts.size === 1) { drag = { x: e.clientX, y: e.clientY }; pinch = null; }
+    else if (pts.size === 2) { const a = [...pts.values()]; pinch = { d: Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) }; drag = null; }
+    fig.classList.add("plot-grabbing");
+  });
+  fig.addEventListener("pointermove", (e) => {
+    if (!pts.has(e.pointerId)) return;
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const a = [...pts.values()];
+    if (a.length === 2 && pinch) { const nd = Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y); if (nd > 0 && pinch.d > 0) st.zoom = Math.max(0.4, Math.min(5, st.zoom * nd / pinch.d)); pinch.d = nd; schedule(); }
+    else if (a.length === 1 && drag) { st.az += (e.clientX - drag.x) * 0.01; st.el = Math.max(-1.45, Math.min(1.45, st.el + (e.clientY - drag.y) * 0.01)); drag.x = e.clientX; drag.y = e.clientY; schedule(); }
+  });
+  const endP = (e) => { pts.delete(e.pointerId); if (pts.size < 2) pinch = null; if (pts.size === 0) { drag = null; fig.classList.remove("plot-grabbing"); } };
+  fig.addEventListener("pointerup", endP); fig.addEventListener("pointercancel", endP);
+  fig.addEventListener("wheel", (e) => { e.preventDefault(); let dy = e.deltaY; if (e.deltaMode === 1) dy *= 16; else if (e.deltaMode === 2) dy *= 100; dy = Math.max(-100, Math.min(100, dy)); st.zoom = Math.max(0.4, Math.min(5, st.zoom * Math.exp(-dy * 0.0012))); schedule(); }, { passive: false });
+  fig.addEventListener("dblclick", (e) => { e.preventDefault(); Object.assign(st, home); schedule(); });
+  const btn = document.createElement("button");
+  btn.type = "button"; btn.className = "plot-reset"; btn.textContent = "⟲";
+  btn.title = (typeof state !== "undefined" && state.lang === "ar") ? "إعادة الضبط" : "Reset view";
+  btn.addEventListener("click", (e) => { e.stopPropagation(); Object.assign(st, home); schedule(); });
+  fig.appendChild(btn);
 }
 
 /* Convert a plot-syntax expression into pretty LaTeX (for the KaTeX legend). Mirrors the
@@ -2169,6 +2295,7 @@ function mathifyTitle(title) {
 let plotSeq = 0;
 const PLOT_W = 480, PLOT_H = 300, PLOT_L = 46, PLOT_R = 16, PLOT_T = 16, PLOT_B = 28;
 const PLOT_PW = PLOT_W - PLOT_L - PLOT_R, PLOT_PH = PLOT_H - PLOT_T - PLOT_B;
+const PLOT_AR = PLOT_PW / PLOT_PH;   // plot-area aspect; equal-aspect views match it so circles render round
 // Fallback colors baked in: if the --plot-cN custom property fails to cascade (e.g. in a print
 // context), stroke:var(--plot-c1) would fall back to "none" → an INVISIBLE curve ("no graph").
 const PLOT_PAL = ["var(--plot-c1,#237a68)", "var(--plot-c2,#3b82f6)", "var(--plot-c3,#ef4444)", "var(--plot-c4,#d97706)", "var(--plot-c5,#7c3aed)"];
@@ -2179,13 +2306,64 @@ function plotParseNum(t) {
   if (!f) return NaN;
   try { const v = f(0); return isFinite(v) ? v : NaN; } catch (_) { return NaN; }
 }
-/* Parse a plot spec → { fns:[{fn|points, expr, color}], dom, mode }. Supports THREE modes:
-   cartesian (y=f(x)), polar (r=f(theta)), parametric (x=f(t) & y=g(t)). null if nothing parses. */
+/* Parse GEOMETRY commands (one per line) → [{t,...}] primitives, or [] if none.
+   Supported: point, label, segment, line, ray, vector, circle, ellipse, arc, angle,
+   triangle, rectangle/square, polygon. Coords are (x,y); options: r=, color=, dashed, fill, "label". */
+function parseShapeSpec(lines) {
+  const shapes = [];
+  const coords = (ln) => [...ln.matchAll(/\(\s*(-?\d*\.?\d+)\s*,\s*(-?\d*\.?\d+)\s*\)/g)].map((m) => [parseFloat(m[1]), parseFloat(m[2])]);
+  const lbl = (ln) => { const q = /["'“”„]([^"'“”„]+)["'“”„]/.exec(ln); if (q) return q[1]; const w = /(?:label|name)\s*[:=]\s*([^\s,]+)/i.exec(ln); return w ? w[1] : null; };
+  const colr = (ln) => { const c = /(?:color|colour|stroke)\s*[:=]\s*(#[0-9a-fA-F]{3,8}|[a-z]+)/i.exec(ln); return c ? c[1] : null; };
+  const num = (ln, key) => { const m = new RegExp(key + "\\s*[:=]\\s*(-?\\d*\\.?\\d+)", "i").exec(ln); return m ? parseFloat(m[1]) : null; };
+  lines.forEach((ln) => {
+    const p = coords(ln), lb = lbl(ln), col = colr(ln), dash = /\bdash(ed)?\b/i.test(ln), fill = /\bfill(ed)?\b/i.test(ln);
+    let m;
+    if (/^point\b/i.test(ln) && p.length >= 1) shapes.push({ t: "point", p: p[0], lb, col });
+    else if (/^(text|label)\b/i.test(ln) && p.length >= 1 && lb) shapes.push({ t: "text", p: p[0], lb, col });
+    else if (/^vector\b/i.test(ln) && p.length >= 2) shapes.push({ t: "vector", a: p[0], b: p[1], lb, col });
+    else if (/^(segment|seg|line|ray)\b/i.test(ln) && p.length >= 2) shapes.push({ t: /^(line|ray)\b/i.test(ln) ? "line" : "segment", a: p[0], b: p[1], lb, col, dash, extend: /^line\b/i.test(ln), ray: /^ray\b/i.test(ln) });
+    else if (/^circle\b/i.test(ln) && p.length >= 1) { let r = num(ln, "r"); if (r == null && p.length >= 2) r = Math.hypot(p[1][0] - p[0][0], p[1][1] - p[0][1]); if (r == null) { const bn = /circle\s*\([^)]*\)\s*(-?\d*\.?\d+)/i.exec(ln); if (bn) r = parseFloat(bn[1]); } if (r != null && isFinite(r) && r > 0) shapes.push({ t: "circle", c: p[0], r, lb, col, dash, fill }); }
+    else if (/^ellipse\b/i.test(ln) && p.length >= 1) { let rx = num(ln, "rx"); if (rx == null) rx = num(ln, "a"); let ry = num(ln, "ry"); if (ry == null) ry = num(ln, "b"); if (rx && ry) shapes.push({ t: "ellipse", c: p[0], rx, ry, lb, col, dash, fill }); }
+    else if (/^arc\b/i.test(ln) && p.length >= 1) { const r = num(ln, "r"), am = /(-?\d*\.?\d+)\s*(?:\.\.|,|to)\s*(-?\d*\.?\d+)\s*(?:deg|°)?/i.exec(ln.replace(/r\s*[:=]\s*-?\d*\.?\d+/i, "")); if (r && am) shapes.push({ t: "arc", c: p[0], r, a1: parseFloat(am[1]), a2: parseFloat(am[2]), col, dash }); }
+    else if (/^angle\b/i.test(ln) && p.length >= 3) shapes.push({ t: "angle", a: p[0], v: p[1], b: p[2], lb, col });
+    else if (/^triangle\b/i.test(ln) && p.length >= 3) shapes.push({ t: "poly", pts: p.slice(0, 3), lb, col, dash, fill: true, closed: true });
+    else if (/^(rectangle|rect|square)\b/i.test(ln) && p.length >= 2) { const [a, b] = p; shapes.push({ t: "poly", pts: [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]]], lb, col, dash, fill: true, closed: true }); }
+    else if (/^(polygon|poly|quad|quadrilateral)\b/i.test(ln) && p.length >= 3) shapes.push({ t: "poly", pts: p, lb, col, dash, fill, closed: true });
+  });
+  return shapes;
+}
+/* Bounding point cloud for a shape (for auto-fitting the view). */
+function shapePoints(s) {
+  if (s.t === "point" || s.t === "text") return [s.p];
+  if (s.t === "vector" || s.t === "segment" || s.t === "line") return [s.a, s.b];
+  if (s.t === "angle") return [s.a, s.v, s.b];
+  if (s.t === "poly") return s.pts;
+  if (s.t === "circle" || s.t === "arc") return [[s.c[0] - s.r, s.c[1]], [s.c[0] + s.r, s.c[1]], [s.c[0], s.c[1] - s.r], [s.c[0], s.c[1] + s.r]];
+  if (s.t === "ellipse") return [[s.c[0] - s.rx, s.c[1]], [s.c[0] + s.rx, s.c[1]], [s.c[0], s.c[1] - s.ry], [s.c[0], s.c[1] + s.ry]];
+  return [];
+}
+
+/* Parse a plot spec → { fns:[{fn|points, expr, color}], dom, mode }. Supports modes:
+   cartesian (y=f(x)), polar (r=f(theta)), parametric (x=f(t)&y=g(t)), surface (z=f(x,y)), geometry (shapes). */
 function parsePlotSpec(spec) {
   const lines = String(spec).split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !/^(#|\/\/)/.test(l));
-  let dom = null, pdom = null, polarSrc = null, px = null, py = null;
+  // GEOMETRY (shapes) — detected when any line starts with a shape command.
+  if (lines.some((l) => /^(point|text|label|vector|segment|seg|line|ray|circle|ellipse|arc|angle|triangle|rectangle|rect|square|polygon|poly|quad|quadrilateral)\b/i.test(l))) {
+    const shapes = parseShapeSpec(lines);
+    if (shapes.length) {
+      const pc = []; shapes.forEach((s) => shapePoints(s).forEach((pt) => pc.push(pt)));
+      return { mode: "geometry", shapes, fns: [], bounds: plotPointsBounds(pc.length ? pc : [[-1, -1], [1, 1]], true) };
+    }
+  }
+  let dom = null, ydom = null, pdom = null, polarSrc = null, px = null, py = null, surfSrc = null;
   const cart = [];
   lines.forEach((ln) => {
+    // 3D surface z = f(x,y)
+    let sm = /^z\s*(?:\(\s*x\s*,\s*y\s*\))?\s*=\s*(.+)$/i.exec(ln);
+    if (sm && /[xy]/i.test(sm[1])) { surfSrc = sm[1].trim(); return; }
+    // y-domain (for 3D)
+    let ym2 = /^y\s*[:=]\s*(-?[0-9.]+)\s*(?:\.\.|,|to|:)\s*(-?[0-9.]+)\s*$/i.exec(ln);
+    if (ym2 && surfSrc) { const a = parseFloat(ym2[1]), b = parseFloat(ym2[2]); if (isFinite(a) && isFinite(b) && a < b) ydom = [a, b]; return; }
     // cartesian x-domain
     let m = /^(?:domain|x)\s*[:=]\s*(-?[0-9.]+)\s*(?:\.\.|,|to|:)\s*(-?[0-9.]+)/i.exec(ln) || /^(-?[0-9.]+)\s*(?:\.\.|to)\s*(-?[0-9.]+)$/i.exec(ln);
     if (m && !/theta|θ|\bt\b/i.test(ln)) { const a = parseFloat(m[1]), b = parseFloat(m[2]); if (isFinite(a) && isFinite(b) && a < b) dom = [a, b]; return; }
@@ -2205,6 +2383,11 @@ function parsePlotSpec(spec) {
     const fn = compilePlotExpr(e, "x");
     if (fn) cart.push({ fn: fn, expr: e, color: PLOT_PAL[cart.length % PLOT_PAL.length] });
   });
+  // 3D SURFACE z = f(x,y)
+  if (surfSrc) {
+    const sf = compilePlot2(surfSrc);
+    if (sf) return { fns: [{ surf: sf, expr: "z = " + surfSrc, color: PLOT_PAL[0] }], mode: "surface", xr: dom || [-3, 3], yr: ydom || dom || [-3, 3] };
+  }
   // POLAR
   if (polarSrc) {
     const rf = compilePlotExpr(polarSrc, "theta");
@@ -2233,7 +2416,12 @@ function plotPointsBounds(pts, equalAspect) {
   if (!isFinite(xmin)) return { xmin: -1, xmax: 1, ymin: -1, ymax: 1 };
   const padX = (xmax - xmin) * 0.1 || 1, padY = (ymax - ymin) * 0.1 || 1;
   xmin -= padX; xmax += padX; ymin -= padY; ymax += padY;
-  if (equalAspect) { const cx = (xmin + xmax) / 2, cy = (ymin + ymax) / 2, r = Math.max(xmax - xmin, ymax - ymin) / 2; xmin = cx - r; xmax = cx + r; ymin = cy - r; ymax = cy + r; }
+  if (equalAspect) {
+    // Match the plot-area aspect (width = AR × height) so 1 unit x = 1 unit y in PIXELS → true circles.
+    const cx = (xmin + xmax) / 2, cy = (ymin + ymax) / 2;
+    const halfY = Math.max((ymax - ymin) / 2, (xmax - xmin) / 2 / PLOT_AR), halfX = halfY * PLOT_AR;
+    xmin = cx - halfX; xmax = cx + halfX; ymin = cy - halfY; ymax = cy + halfY;
+  }
   return { xmin, xmax, ymin, ymax };
 }
 
@@ -2253,7 +2441,8 @@ function plotAutoY(fns, x0, x1) {
 }
 
 /* Render the SVG for fns at an explicit view {xmin,xmax,ymin,ymax}. Pure — re-run on pan/zoom. */
-function plotSvgString(fns, view) {
+function plotSvgString(fns, view, opts) {
+  opts = opts || {};
   const xmin = view.xmin, xmax = view.xmax, ymin = view.ymin, ymax = view.ymax;
   const W = PLOT_W, H = PLOT_H, L = PLOT_L, T = PLOT_T, pw = PLOT_PW, ph = PLOT_PH;
   const sx = (x) => L + (x - xmin) / (xmax - xmin) * pw;
@@ -2263,6 +2452,23 @@ function plotSvgString(fns, view) {
   const xStep = nice(xmax - xmin, 8), yStep = nice(ymax - ymin, 6);
   const id = "pl" + (plotSeq++);
   let grid = "", ax = "", curves = "";
+  if (opts.polar) {
+    // POLAR GRID — concentric rings + angular rays centered on the origin (circular background).
+    const cx = sx(0), cy = sy(0);
+    const rMax = Math.max(Math.abs(xmin), Math.abs(xmax), Math.abs(ymin), Math.abs(ymax));
+    const rStep = nice(rMax, 5), pxX = pw / (xmax - xmin), pxY = ph / (ymax - ymin);
+    for (let r = rStep; r <= rMax * 1.02; r += rStep) {
+      grid += `<ellipse class="plot-grid" cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" rx="${(r * pxX).toFixed(1)}" ry="${(r * pxY).toFixed(1)}" fill="none"/>`;
+      grid += `<text class="plot-tick" x="${(cx + r * pxX + 3).toFixed(1)}" y="${(cy - 3).toFixed(1)}">${fmt(r)}</text>`;
+    }
+    for (let deg = 0; deg < 360; deg += 30) {
+      const a = deg * Math.PI / 180, ex = cx + Math.cos(a) * rMax * pxX, ey = cy - Math.sin(a) * rMax * pxY;
+      grid += `<line class="plot-grid" x1="${cx.toFixed(1)}" y1="${cy.toFixed(1)}" x2="${ex.toFixed(1)}" y2="${ey.toFixed(1)}"/>`;
+    }
+    // bold x/y axes through the origin
+    ax += `<line class="plot-axis" x1="${L}" y1="${cy.toFixed(1)}" x2="${(L + pw).toFixed(1)}" y2="${cy.toFixed(1)}" marker-end="url(#${id}a)"/>`;
+    ax += `<line class="plot-axis" x1="${cx.toFixed(1)}" y1="${(T + ph).toFixed(1)}" x2="${cx.toFixed(1)}" y2="${T}" marker-end="url(#${id}a)"/>`;
+  } else {
   for (let x = Math.ceil(xmin / xStep) * xStep; x <= xmax + 1e-9; x += xStep) {
     const X = sx(x); grid += `<line class="plot-grid" x1="${X.toFixed(1)}" y1="${T}" x2="${X.toFixed(1)}" y2="${(T + ph).toFixed(1)}"/>`;
     if (Math.abs(x) > 1e-9) grid += `<text class="plot-tick" x="${X.toFixed(1)}" y="${(T + ph + 14).toFixed(1)}" text-anchor="middle">${fmt(x)}</text>`;
@@ -2273,6 +2479,7 @@ function plotSvgString(fns, view) {
   }
   if (0 >= ymin && 0 <= ymax) { const Y = sy(0); ax += `<line class="plot-axis" x1="${L}" y1="${Y.toFixed(1)}" x2="${(L + pw).toFixed(1)}" y2="${Y.toFixed(1)}" marker-end="url(#${id}a)"/><text class="plot-axislabel" x="${(L + pw - 3).toFixed(1)}" y="${(Y - 6).toFixed(1)}" text-anchor="end">x</text>`; }
   if (0 >= xmin && 0 <= xmax) { const X = sx(0); ax += `<line class="plot-axis" x1="${X.toFixed(1)}" y1="${(T + ph).toFixed(1)}" x2="${X.toFixed(1)}" y2="${T}" marker-end="url(#${id}a)"/><text class="plot-axislabel" x="${(X + 7).toFixed(1)}" y="${(T + 9).toFixed(1)}">y</text>`; }
+  }
   const N = 500, span = ymax - ymin;
   fns.forEach((f) => {
     let d = "", up = true;
@@ -2288,11 +2495,75 @@ function plotSvgString(fns, view) {
     }
     if (d) curves += `<path class="plot-curve" style="stroke:${f.color}" d="${d}"/>`;
   });
+  // GEOMETRY shapes (opts.shapes) — drawn on the same axes so circles/triangles/vectors render natively.
+  let shapesSvg = "";
+  if (opts.shapes && opts.shapes.length) {
+    const pxX = pw / (xmax - xmin), pxY = ph / (ymax - ymin);
+    const SX = (p) => sx(p[0]), SY = (p) => sy(p[1]);
+    const fillOf = (col) => { const h = col.replace("#", ""); if (h.length === 6) { const r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16); return `rgba(${r},${g},${b},0.13)`; } return "rgba(59,130,246,0.13)"; };
+    const dashA = (s) => s.dash ? ' stroke-dasharray="5 4"' : "";
+    const txt = (x, y, str, col, anc) => `<text x="${x.toFixed(1)}" y="${y.toFixed(1)}" fill="${col}" font-size="14" font-weight="600"${anc ? ` text-anchor="${anc}"` : ""} style="font-family:'Segoe UI','Tajawal',sans-serif" paint-order="stroke" stroke="#ffffff" stroke-width="2.6" stroke-linejoin="round">${escapeHtml(str)}</text>`;
+    const arrowHead = (x1, y1, x2, y2, col) => { const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len, sz = 9, w = 4.2; const bx = x2 - ux * sz, by = y2 - uy * sz; return `<polygon points="${x2.toFixed(1)} ${y2.toFixed(1)} ${(bx - uy * w).toFixed(1)} ${(by + ux * w).toFixed(1)} ${(bx + uy * w).toFixed(1)} ${(by - ux * w).toFixed(1)}" fill="${col}"/>`; };
+    const DEF = "#237a68";
+    opts.shapes.forEach((s) => {
+      const c = s.col || null;
+      if (s.t === "point") {
+        const X = SX(s.p), Y = SY(s.p), col = c || "#ef4444";
+        shapesSvg += `<circle cx="${X.toFixed(1)}" cy="${Y.toFixed(1)}" r="3.7" fill="${col}" stroke="#ffffff" stroke-width="1.3"/>`;
+        if (s.lb) shapesSvg += txt(X + 7, Y - 7, s.lb, c || "#b91c1c");
+      } else if (s.t === "text") {
+        shapesSvg += txt(SX(s.p), SY(s.p), s.lb, c || "#1f2937", "middle");
+      } else if (s.t === "segment" || s.t === "line" || s.t === "vector") {
+        let a = s.a, b = s.b;
+        if (s.extend) { const cl = clipSegToView([a[0], a[1]], [b[0], b[1]], xmin, xmax, ymin, ymax); if (cl) { a = cl[0]; b = cl[1]; } }
+        const col = c || (s.t === "vector" ? "#7c3aed" : "#334155");
+        const x1 = SX(a), y1 = SY(a), x2 = SX(b), y2 = SY(b);
+        shapesSvg += `<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="${col}" stroke-width="2.1" stroke-linecap="round"${dashA(s)}/>`;
+        if (s.t === "vector") shapesSvg += arrowHead(x1, y1, x2, y2, col);
+        if (s.lb) shapesSvg += txt((x1 + x2) / 2 + 6, (y1 + y2) / 2 - 6, s.lb, col);
+      } else if (s.t === "circle") {
+        const col = c || DEF, X = SX(s.c), Y = SY(s.c);
+        shapesSvg += `<ellipse cx="${X.toFixed(1)}" cy="${Y.toFixed(1)}" rx="${(s.r * pxX).toFixed(1)}" ry="${(s.r * pxY).toFixed(1)}" fill="${s.fill ? fillOf(col) : "none"}" stroke="${col}" stroke-width="2"${dashA(s)}/>`;
+        shapesSvg += `<circle cx="${X.toFixed(1)}" cy="${Y.toFixed(1)}" r="2.4" fill="${col}"/>`;
+        if (s.lb) shapesSvg += txt(X, (Y - s.r * pxY - 6), s.lb, col, "middle");
+      } else if (s.t === "ellipse") {
+        const col = c || DEF, X = SX(s.c), Y = SY(s.c);
+        shapesSvg += `<ellipse cx="${X.toFixed(1)}" cy="${Y.toFixed(1)}" rx="${(s.rx * pxX).toFixed(1)}" ry="${(s.ry * pxY).toFixed(1)}" fill="${s.fill ? fillOf(col) : "none"}" stroke="${col}" stroke-width="2"${dashA(s)}/>`;
+        if (s.lb) shapesSvg += txt(X, (Y - s.ry * pxY - 6), s.lb, col, "middle");
+      } else if (s.t === "poly") {
+        const col = c || DEF, pts = s.pts.map((p) => SX(p).toFixed(1) + "," + SY(p).toFixed(1)).join(" ");
+        shapesSvg += `<polygon points="${pts}" fill="${s.fill ? fillOf(col) : "none"}" stroke="${col}" stroke-width="2" stroke-linejoin="round"${dashA(s)}/>`;
+        if (s.lb) { const cx = s.pts.reduce((a, p) => a + p[0], 0) / s.pts.length, cy = s.pts.reduce((a, p) => a + p[1], 0) / s.pts.length; shapesSvg += txt(SX([cx, cy]), SY([cx, cy]), s.lb, col, "middle"); }
+      } else if (s.t === "arc") {
+        const col = c || DEF, a1 = s.a1 * Math.PI / 180, a2 = s.a2 * Math.PI / 180, K = 48; let d = "";
+        for (let k = 0; k <= K; k++) { const t = a1 + (a2 - a1) * k / K, px = s.c[0] + s.r * Math.cos(t), py = s.c[1] + s.r * Math.sin(t); d += (k ? "L" : "M") + SX([px, py]).toFixed(1) + " " + SY([px, py]).toFixed(1) + " "; }
+        shapesSvg += `<path d="${d}" fill="none" stroke="${col}" stroke-width="2"${dashA(s)}/>`;
+      } else if (s.t === "angle") {
+        const col = c || "#d97706", vX = SX(s.v), vY = SY(s.v);
+        const aX = SX(s.a) - vX, aY = SY(s.a) - vY, bX = SX(s.b) - vX, bY = SY(s.b) - vY;
+        let ang1 = Math.atan2(aY, aX), ang2 = Math.atan2(bY, bX); let dA = ang2 - ang1; while (dA > Math.PI) dA -= 2 * Math.PI; while (dA < -Math.PI) dA += 2 * Math.PI;
+        const rr = 22, K = 24; let d = "";
+        for (let k = 0; k <= K; k++) { const t = ang1 + dA * k / K; d += (k ? "L" : "M") + (vX + rr * Math.cos(t)).toFixed(1) + " " + (vY + rr * Math.sin(t)).toFixed(1) + " "; }
+        shapesSvg += `<path d="${d}" fill="none" stroke="${col}" stroke-width="2"/>`;
+        if (s.lb) { const mt = ang1 + dA / 2; shapesSvg += txt(vX + (rr + 13) * Math.cos(mt), vY + (rr + 13) * Math.sin(mt) + 4, s.lb, col, "middle"); }
+      }
+    });
+  }
   return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="function graph">` +
     `<defs><clipPath id="${id}c"><rect x="${L}" y="${T}" width="${pw}" height="${ph}"/></clipPath>` +
     `<marker id="${id}a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path class="plot-arrow" d="M0 0L10 5L0 10z"/></marker></defs>` +
     `<rect class="plot-bg" x="${L}" y="${T}" width="${pw}" height="${ph}" rx="6"/>` +
-    grid + ax + `<g clip-path="url(#${id}c)">${curves}</g>` + `</svg>`;
+    grid + ax + `<g clip-path="url(#${id}c)">${curves}${shapesSvg}</g>` + `</svg>`;
+}
+
+/* Clip a segment a→b to the rectangle [xmin,xmax]×[ymin,ymax] (Liang–Barsky). Returns [a',b'] or null. */
+function clipSegToView(a, b, xmin, xmax, ymin, ymax) {
+  let t0 = 0, t1 = 1; const dx = b[0] - a[0], dy = b[1] - a[1];
+  const clip = (p, q) => { if (Math.abs(p) < 1e-12) return q >= 0; const r = q / p; if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; } else { if (r < t0) return false; if (r < t1) t1 = r; } return true; };
+  if (clip(-dx, a[0] - xmin) && clip(dx, xmax - a[0]) && clip(-dy, a[1] - ymin) && clip(dy, ymax - a[1])) {
+    return [[a[0] + t0 * dx, a[1] + t0 * dy], [a[0] + t1 * dx, a[1] + t1 * dy]];
+  }
+  return null;
 }
 
 /* The home view for a parsed spec: point-cloud bounds for polar/parametric, auto-y for cartesian. */
@@ -2304,15 +2575,17 @@ function plotHomeView(p) {
 /* Back-compat: render straight from a spec at the auto view. */
 function renderPlotSvg(spec) {
   const p = parsePlotSpec(spec); if (!p) return null;
-  return plotSvgString(p.fns, plotHomeView(p));
+  if (p.mode === "surface") return plot3dSurfaceSvg(p.fns[0].surf, p.xr, p.yr, p.fns[0].expr);
+  return plotSvgString(p.fns, plotHomeView(p), { polar: p.mode === "polar" || p.mode === "parametric", shapes: p.shapes });
 }
 
 /* Make a rendered plot pan/zoomable: mouse drag + wheel; touch one-finger pan + two-finger pinch;
    double-click or the ⟲ button resets to the home view. Re-renders each frame so axes stay crisp. */
-function makePlotInteractive(fig, fns, home) {
+function makePlotInteractive(fig, fns, home, opts) {
+  opts = opts || {};
   const mk = () => ({ xmin: home.xmin, xmax: home.xmax, ymin: home.ymin, ymax: home.ymax });
   let view = mk(), target = mk(), raf = 0, anim = 0;
-  const drawNow = () => { const old = fig.querySelector("svg"); if (!old) return; const tmp = document.createElement("div"); tmp.innerHTML = plotSvgString(fns, view); const ns = tmp.firstElementChild; if (ns) fig.replaceChild(ns, old); };
+  const drawNow = () => { const old = fig.querySelector("svg"); if (!old) return; const tmp = document.createElement("div"); tmp.innerHTML = plotSvgString(fns, view, opts); const ns = tmp.firstElementChild; if (ns) fig.replaceChild(ns, old); };
   const schedule = () => { if (!raf) raf = requestAnimationFrame(() => { raf = 0; drawNow(); }); };
   // Ease `view` toward `target` over a few frames → smooth zoom (pan sets both directly = no lag).
   const step = () => {
@@ -2386,26 +2659,33 @@ function plotifyCodeBlock(code) {
   const pre = code.parentElement; if (!pre) return false;
   const p = parsePlotSpec(code.textContent || "");
   if (!p) return false; // couldn't parse a function → leave as a normal code box
-  const home = plotHomeView(p);
   const fig = document.createElement("figure");
-  fig.className = "tikz-figure plot-figure plot-interactive";
-  fig.innerHTML = plotSvgString(p.fns, home);
+  fig.className = "tikz-figure plot-figure plot-interactive" + (p.mode === "surface" ? " plot-figure--3d" : "");
+  const home = p.mode === "surface" ? null : plotHomeView(p);
+  const isPolar = p.mode === "polar" || p.mode === "parametric";
+  fig.innerHTML = p.mode === "surface" ? plot3dSurfaceSvg(p.fns[0].surf, p.xr, p.yr, p.fns[0].expr) : plotSvgString(p.fns, home, { polar: isPolar, shapes: p.shapes });
   // Beautiful math legend (HTML + KaTeX overlay) — built once, stays fixed during pan/zoom.
-  const leg = document.createElement("div");
-  leg.className = "plot-legend";
-  p.fns.forEach((f) => {
-    const row = document.createElement("div"); row.className = "plot-legend__row";
-    const sw = document.createElement("span"); sw.className = "plot-legend__sw"; sw.style.background = f.color;
-    const lb = document.createElement("span"); lb.className = "plot-legend__lb";
-    // polar/parametric already carry a full "r = …" / "x = …, y = …" label; cartesian gets "y = …".
-    const tex = f.points ? null : plotExprToLatex(f.expr);
-    lb.textContent = tex ? ("\\(y = " + tex + "\\)") : (f.points ? ("\\(" + f.expr + "\\)") : ("y = " + f.expr));
-    row.appendChild(sw); row.appendChild(lb); leg.appendChild(row);
-  });
-  fig.appendChild(leg);
-  typesetMath(leg);
+  // Geometry has no function legend.
+  if (p.mode !== "geometry" && p.fns.length) {
+    const leg = document.createElement("div");
+    leg.className = "plot-legend";
+    p.fns.forEach((f) => {
+      const row = document.createElement("div"); row.className = "plot-legend__row";
+      const sw = document.createElement("span"); sw.className = "plot-legend__sw"; sw.style.background = f.color;
+      const lb = document.createElement("span"); lb.className = "plot-legend__lb";
+      // polar/parametric/surface carry a full label; cartesian gets "y = …".
+      const tex = (f.points || f.surf) ? null : plotExprToLatex(f.expr);
+      lb.textContent = tex ? ("\\(y = " + tex + "\\)") : ((f.points || f.surf) ? ("\\(" + f.expr + "\\)") : ("y = " + f.expr));
+      row.appendChild(sw); row.appendChild(lb); leg.appendChild(row);
+    });
+    fig.appendChild(leg);
+    typesetMath(leg);
+  }
   pre.replaceWith(fig);
-  try { makePlotInteractive(fig, p.fns, home); } catch (_) {}
+  try {
+    if (p.mode === "surface") make3dInteractive(fig, p.fns[0].surf, p.xr, p.yr, p.fns[0].expr);   // drag-rotate + zoom
+    else makePlotInteractive(fig, p.fns, home, { polar: isPolar, shapes: p.shapes });
+  } catch (_) {}
   return true;
 }
 
@@ -4299,7 +4579,7 @@ function exportCss(th, isAr, scope, tpl) {
   return (
     (scope ? scope + "{width:794px;overflow:hidden}" : "@page{size:A4;margin:18mm 16mm}") +
     dp + "*{box-sizing:border-box}" +
-    root + "{font-family:" + fontStack + ";color:#" + ink + ";background:#" + bg + ";line-height:1.7;font-size:11.5pt;margin:0;padding:0;-webkit-print-color-adjust:exact;print-color-adjust:exact}" +
+    root + "{font-family:" + fontStack + ";color:#" + ink + ";background:#" + bg + ";line-height:1.72;font-size:12.8pt;margin:0;padding:0;-webkit-print-color-adjust:exact;print-color-adjust:exact;color-scheme:only light}" +
     // ── COVER: premium layered art — soft accent glows over a deep gradient, a fine ring
     // ornament, elegant serif title. No brand, no date — clean and editorial.
     dp + ".cover{position:relative;height:251mm;color:#FFF;page-break-after:always;break-after:page;overflow:hidden;" +
@@ -4322,12 +4602,12 @@ function exportCss(th, isAr, scope, tpl) {
     dp + ".cover__date{font-family:" + sansStack + ";font-size:11pt;color:rgba(255,255,255,.72)}" +
     dp + ".doc{padding-top:2mm}" +
     // Editorial lead: the opening paragraph reads slightly larger, like a professional report.
-    dp + ".doc>p:first-of-type{font-size:12.6pt;line-height:1.75;color:" + rgba(ink, 0.92) + "}" +
+    dp + ".doc>p:first-of-type{font-size:13.8pt;line-height:1.78;color:#" + ink + "}" +
     dp + "h1," + dp + "h2," + dp + "h3," + dp + "h4{font-family:" + sansStack + ";color:#" + ink + ";line-height:1.3;font-weight:700;" + (isAr ? "letter-spacing:normal;word-spacing:.04em;" : "letter-spacing:-.01em;") + "page-break-after:avoid;break-after:avoid}" +
-    dp + "h1{font-size:22pt;margin:.2em 0 .5em;padding-bottom:.24em;border-bottom:2.5px solid #" + th.accent + "}" +
-    dp + "h2{font-size:16.5pt;margin:1.35em 0 .5em;color:#" + ink + ";padding-inline-start:.55em;border-inline-start:4.5px solid #" + th.accent + "}" +
-    dp + "h3{font-size:13.5pt;margin:1em 0 .4em;color:#" + th.accent + "}" +
-    dp + "h4{font-size:12pt;margin:.9em 0 .35em}" +
+    dp + "h1{font-size:23.5pt;margin:.2em 0 .5em;padding-bottom:.24em;border-bottom:2.5px solid #" + th.accent + "}" +
+    dp + "h2{font-size:17.5pt;margin:1.35em 0 .5em;color:#" + ink + ";padding-inline-start:.55em;border-inline-start:4.5px solid #" + th.accent + "}" +
+    dp + "h3{font-size:14.5pt;margin:1em 0 .4em;color:#" + th.accent + "}" +
+    dp + "h4{font-size:13pt;margin:.9em 0 .35em}" +
     dp + "p{margin:0 0 .75em;orphans:2;widows:2}" +
     dp + "ul," + dp + "ol{margin:0 0 .8em;padding-inline-start:1.5em}" + dp + "li{margin:.3em 0;page-break-inside:avoid}" +
     dp + "li::marker{color:#" + th.accent + "}" +
@@ -4345,9 +4625,9 @@ function exportCss(th, isAr, scope, tpl) {
     dp + "blockquote p:last-child{margin-bottom:0}" +
     dp + "hr{border:none;border-top:1px solid #" + line + ";margin:1.4em 0}" +
     dp + "code{font-family:Consolas,Menlo,monospace;font-size:9.5pt;background:#" + th.soft + ";padding:1px 5px;border-radius:3px;direction:ltr;unicode-bidi:embed}" +
-    dp + "pre{background:#1f2422;color:#eef1ef;border-radius:8px;padding:13px 15px;overflow:auto;direction:ltr;text-align:left;page-break-inside:avoid;font-size:9.5pt;line-height:1.55}" +
+    dp + "pre{background:#1f2422;color:#eef1ef;border-radius:8px;padding:13px 15px;overflow:auto;direction:ltr;text-align:left;page-break-inside:avoid;font-size:10.5pt;line-height:1.55}" +
     dp + "pre code{background:none;padding:0;font-size:inherit;color:inherit}" +
-    dp + "table{border-collapse:collapse;width:100%;margin:.6em 0 1.1em;font-size:10pt;page-break-inside:avoid}" +
+    dp + "table{border-collapse:collapse;width:100%;margin:.6em 0 1.1em;font-size:11pt;page-break-inside:avoid}" +
     dp + "th," + dp + "td{border:1px solid #" + line + ";padding:8px 11px;text-align:start;vertical-align:top}" +
     dp + "th{background:#" + th.accent + ";color:#fff;font-weight:700}" +
     dp + "tr:nth-child(even) td{background:#" + th.zebra + "}" +
@@ -4357,7 +4637,7 @@ function exportCss(th, isAr, scope, tpl) {
     dp + "img{max-width:100%;page-break-inside:avoid;break-inside:avoid;border-radius:6px}" +
     // Real web images placed by the author: centered, framed, magazine-like.
     dp + "p>img:only-child," + dp + "p>img:first-child{display:block;margin:1.1em auto .5em;max-width:88%;max-height:80mm;object-fit:cover;border-radius:10px;box-shadow:0 3px 14px " + rgba(th.deep, 0.22) + ";border:1px solid #" + line + "}" +
-    dp + "p>img+em," + dp + "img+em{display:block;text-align:center;font-family:" + sansStack + ";font-size:9.5pt;color:" + rgba(ink, 0.62) + ";margin-top:.2em}" +
+    dp + "p>img+em," + dp + "img+em{display:block;text-align:center;font-family:" + sansStack + ";font-size:9.5pt;color:#55534c;margin-top:.2em}" +
     // Editorial end ornament after the last section.
     dp + ".doc::after{content:'❖';display:block;text-align:center;color:#" + th.accent + ";font-size:13pt;margin:2.2em 0 .5em;opacity:.85}" +
     dp + ".tikz-figure{margin:1.1em 0;text-align:center;page-break-inside:avoid;break-inside:avoid}" +
@@ -4381,7 +4661,33 @@ function exportCss(th, isAr, scope, tpl) {
     dp + ".katex-display{margin:1.15em 0;max-width:100%;overflow:visible;page-break-inside:avoid;direction:ltr;text-align:center}" +
     dp + ".katex{max-width:100%;direction:ltr}" +
     dp + ".katex-display>.katex{display:inline-block;text-align:initial}" +
-    templateCss(String(tpl || "").toLowerCase().trim(), th, isAr, scope)
+    // KaTeX hides its raw-LaTeX MathML via clip; html2canvas IGNORES clip and would paint the raw
+    // "\sin(6\theta)" source next to the rendered math. Force it hidden so PDFs show ONLY pretty math.
+    dp + ".katex-mathml{display:none!important}" +
+    templateCss(String(tpl || "").toLowerCase().trim(), th, isAr, scope) +
+    // ═══ INK ARMOR (last — beats everything, incl. template CSS) ═══════════════════════════════
+    // Dark-mode extensions (Dark Reader) and Chrome's Auto Dark rewrite the page's computed colors
+    // to LIGHT text; the capture then paints light text on the forced-white page → a washed-out,
+    // unreadable PDF (real user report). Force full-black ink + full opacity, and opt the export
+    // out of auto-dark. Cover (white-on-deep) and table headers (white-on-accent) are re-asserted.
+    dp + ".doc," + dp + ".doc *{opacity:1!important;filter:none!important;mix-blend-mode:normal!important;-webkit-text-fill-color:currentColor!important;color-scheme:only light}" +
+    dp + ".doc p," + dp + ".doc li," + dp + ".doc td," + dp + ".doc strong," + dp + ".doc em," + dp + ".doc div," + dp + ".doc span," + dp + ".doc figcaption{color:#000!important}" +
+    dp + ".doc h1," + dp + ".doc h2," + dp + ".doc h4{color:#" + ink + "!important}" +
+    dp + ".doc h3{color:#" + th.accent + "!important}" +
+    dp + ".doc .li-n{color:#" + th.accent + "!important}" +
+    dp + ".doc .katex," + dp + ".doc .katex *{color:inherit!important}" +
+    dp + ".doc th{background:#" + th.accent + "!important;color:#fff!important}" +
+    dp + ".doc th *{color:#fff!important}" +
+    dp + ".doc pre{background:#1f2422!important}" + dp + ".doc pre," + dp + ".doc pre *{color:#eef1ef!important}" +
+    dp + ".doc code{color:#1a1a18!important}" + dp + ".doc pre code{color:#eef1ef!important}" +
+    dp + ".doc p>img+em," + dp + ".doc img+em{color:#55534c!important}" +
+    // corporate template renders blockquotes as white-on-accent KPI cards — keep them white
+    (String(tpl || "").toLowerCase().trim() === "corporate" ?
+      dp + ".doc blockquote," + dp + ".doc blockquote *{color:#fff!important}" : "") +
+    // academic template has a LIGHT cover with dark title — don't force white there
+    (String(tpl || "").toLowerCase().trim() === "academic" ? "" :
+      dp + ".cover__title{color:#FFF!important}" + dp + ".cover__sub{color:rgba(255,255,255,.82)!important}") +
+    dp + ".doc .plot-tick{fill:#4b5563!important}" + dp + ".doc .plot-axislabel{fill:#374151!important}"
   );
 }
 
@@ -4565,9 +4871,16 @@ async function exportPdf(turn, lang, msg) {
   const mdNode = mdNodeForTurn(turn);
   if (!mdNode || !mdNode.textContent.trim()) { showToast(t().exportEmpty); return; }
   // Direction follows the CONTENT, not the UI language — an ENGLISH exam must render LTR even when the
-  // user's language is Arabic, otherwise the LTR text overflows and gets CUT on the RTL side.
-  const _dt = mdNode.textContent || "";
-  const isAr = ((_dt.match(/[؀-ۿ]/g) || []).length) > ((_dt.match(/[A-Za-z]/g) || []).length);
+  // user's language is Arabic. CRITICAL: count PROSE only — math (KaTeX) and code are full of Latin
+  // (e^x, dx, sin, ln…) and a math-heavy ARABIC doc was mis-detected as English → wrong (Latin) font
+  // stack → broken Arabic shaping. Strip math/code before counting.
+  const _pn = mdNode.cloneNode(true);
+  _pn.querySelectorAll(".katex, .katex-display, code, pre, .plot-figure, .tikz-figure, .plot-legend").forEach((n) => n.remove());
+  const _dt = _pn.textContent || "";
+  const _arN = (_dt.match(/[؀-ۿ]/g) || []).length, _laN = (_dt.match(/[A-Za-z]/g) || []).length;
+  // Arabic wins if it's the majority of prose OR clearly substantial (a mostly-Arabic doc with some
+  // English terms still renders RTL with the Arabic font).
+  const isAr = _arN > 0 && (_arN >= _laN || _arN >= 12);
   ensureFileTitle(meta, mdNode);
   const th = themeFor(meta);
   // Save-as filename = the request/title (Chrome uses document.title as the default PDF name).
@@ -4596,7 +4909,14 @@ async function exportPdf(turn, lang, msg) {
     cover + "<div class='doc'>" + body + "</div>";
   numberListsExplicitly(root.querySelector(".doc"));
   const titleEl = root.querySelector(".cover__title");
-  if (titleEl) { titleEl.textContent = mathifyTitle(titleEl.textContent); typesetMath(titleEl); }
+  if (titleEl) {
+    let tt = titleEl.textContent;
+    // If the title ALREADY has math delimiters ($…$, \(…\)), render them directly — mathifyTitle is
+    // for plain-text math only and double-processing produced garbled/duplicated titles.
+    if (!/\$|\\\(|\\\[/.test(tt)) tt = mathifyTitle(tt);
+    titleEl.textContent = tt;
+    typesetMath(titleEl);
+  }
   document.body.appendChild(root);
 
   showToast(t().preparing);
@@ -4695,7 +5015,7 @@ async function exportPdf(turn, lang, msg) {
       const cr = document.createElement("div");
       cr.id = "firasExportChunk";
       cr.setAttribute("dir", root.getAttribute("dir") || "rtl");
-      cr.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff;z-index:-1";
+      cr.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff;z-index:-1;color-scheme:only light";
       const st = document.createElement("style"); st.textContent = styleTxt.replace(/#firasExportRoot/g, "#firasExportChunk"); cr.appendChild(st);
       if (ch.isCover) { cr.appendChild(ch.nodes[0]); }
       else { const dd = document.createElement("div"); dd.className = "doc"; ch.nodes.forEach((n) => dd.appendChild(n)); cr.appendChild(dd); }
@@ -4707,21 +5027,60 @@ async function exportPdf(turn, lang, msg) {
       if (!canvas || !canvas.width || !canvas.height) { cr.remove(); continue; }
       const pxPerMm = canvas.width / contentWmm;
       const rr = cr.getBoundingClientRect(), sc = canvas.height / Math.max(rr.height, 1);
+      const pageFullPx = pageContentMm * pxPerMm;
+      const yTop = (el) => (el.getBoundingClientRect().top - rr.top) * sc;
+      const yBot = (el) => (el.getBoundingClientRect().bottom - rr.top) * sc;
       const breaks = [];
-      cr.querySelectorAll("p,li,h1,h2,h3,h4,figure,tr,blockquote,pre,.katex-display,.tikz-figure,.plot-figure,table,hr").forEach((el) => {
-        const y = (el.getBoundingClientRect().bottom - rr.top) * sc;
+      cr.querySelectorAll("p,li,h1,h2,h3,h4,figure,tr,blockquote,pre,.katex-display,.tikz-figure,.plot-figure,table,hr,ul,ol").forEach((el) => {
+        const y = yBot(el);
         if (y > 1 && y < canvas.height) breaks.push(y);
       });
       breaks.push(canvas.height); breaks.sort((a, b) => a - b);
+      // ATOMIC ZONES that must NEVER be split across a page boundary: equations, figures, images,
+      // code, quotes, list items, tables. Plus "keep a heading with the block that follows it".
+      // Only blocks that CAN fit on one page are protected; anything taller is allowed to break.
+      const zones = [];
+      cr.querySelectorAll(".katex-display,figure,.plot-figure,.tikz-figure,img,pre,blockquote,li,table").forEach((el) => {
+        const t = yTop(el), b = yBot(el);
+        if (b - t > 4 && b - t <= pageFullPx * 0.98) zones.push([t, b]);
+      });
+      cr.querySelectorAll("h1,h2,h3,h4").forEach((el) => {
+        const nx = el.nextElementSibling, t = yTop(el);
+        let b = yBot(el);
+        if (nx) b = Math.min(yBot(nx), yTop(nx) + Math.min(yBot(nx) - yTop(nx), 70 * sc));  // heading + start of next block
+        if (b - t > 4 && b - t <= pageFullPx * 0.98) zones.push([t, b]);
+      });
+      // Move a candidate cut OUT of any atomic zone (up to the zone's top → the block flows to the next page).
+      const avoidSplit = (cut, from) => {
+        for (let it = 0; it < 8; it++) {
+          let moved = false;
+          for (const z of zones) { if (cut > z[0] + 1 && cut < z[1] - 1 && z[0] > from + 24) { cut = z[0]; moved = true; } }
+          if (!moved) break;
+        }
+        return cut;
+      };
       let srcY = 0;
       while (srcY < canvas.height - 2) {
         let availMm = pageContentMm - usedMm;
         if (availMm < 16) { closePage(); availMm = pageContentMm; }   // don't start content in a sliver
         const capacityPx = availMm * pxPerMm;
         const limit = srcY + capacityPx;
+        // If an atomic block starts at the top of the remaining space but overflows it, and the page is
+        // already partly filled, move the WHOLE block to a fresh page (this is what stops equations/
+        // figures from being cut with half on one page and half on the next).
+        if (usedMm > 0.5) {
+          let ov = null;
+          for (const z of zones) { if (z[0] <= srcY + 24 && z[1] > limit + 1) { ov = z; break; } }
+          if (ov) { closePage(); continue; }
+        }
         let cut = 0;
         for (const bp of breaks) { if (bp > srcY + 24 && bp <= limit + 0.5) cut = bp; }
         if (!cut) cut = Math.min(limit, canvas.height);
+        cut = avoidSplit(Math.min(cut, canvas.height), srcY);
+        if (cut <= srcY + 24) {                                        // protecting a block left nothing to place here
+          if (usedMm > 0.5) { closePage(); continue; }                //   → give it a fresh full page
+          cut = Math.min(limit, canvas.height);                       //   → block taller than a whole page: must cut
+        }
         cut = Math.min(cut, canvas.height);
         const sliceH = Math.max(1, Math.round(cut - srcY));
         const slice = document.createElement("canvas"); slice.width = canvas.width; slice.height = sliceH;
@@ -6006,6 +6365,24 @@ function updateSendState() {
    Networking — streaming send with abort + timeout + offline fallback
 ---------------------------------------------------------------------------- */
 
+/* STEM questions are HARD BY DEFAULT on EVERY tier and EVERY engine (user mandate). Appended to
+   the chat system prompt, the file-document author, the batch workbook author, and the Agent's
+   exam guide — so "اعطني أسئلة فيزياء" yields genuinely hard, novel, distinctive problems even on
+   Mini and even when a fallback engine answers, unless the user EXPLICITLY asks for easy/basic. */
+const STEM_HARD_RULE =
+  " STEM DIFFICULTY — HARD BY DEFAULT (every tier, every engine): whenever you GENERATE questions, " +
+  "problems, exams or worksheets in mathematics, physics, chemistry or any quantitative science and the " +
+  "user did NOT explicitly ask for an easy/basic/beginner level, make them GENUINELY HARD — strong " +
+  "competition / JEE-Advanced calibre: every problem multi-concept and multi-step, built on TRICKY ideas " +
+  "(clever substitutions, symmetry/King's rule, chained integration by parts, hyperbolic identities, " +
+  "floor/ceiling behaviour, parametric traps, limits of sums, non-obvious conservation arguments, " +
+  "multi-stage stoichiometry/equilibria…). NEVER routine textbook drills (∫x·sinh x dx by parts alone is a " +
+  "FAILURE — too easy). Every problem must be NOVEL, UNIQUE and DISTINCTIVE: constructed by YOU with fresh " +
+  "structures, functions, numbers and scenarios — never a known classic, a famous competition problem, or a " +
+  "lightly reworded book/net exercise. Make each exam varied (no two problems test the same single idea) and " +
+  "exam-worthy — while staying VALID, well-posed and cleanly solvable with exact answers (solve each one " +
+  "yourself first; discard anything you cannot solve cleanly).";
+
 /** Build the messages array for the API from a tier + conversation slice. */
 function buildMessages(tier, conversation, replyLang) {
   const model = MODELS[tier];
@@ -6095,41 +6472,64 @@ function buildMessages(tier, conversation, replyLang) {
     "into the original equation, differentiate an antiderivative back to the integrand, re-add/re-multiply, " +
     "verify units and dimensional consistency, and test edge cases. If a check fails, fix it silently and " +
     "give only the corrected result. State exact closed forms (fractions, radicals, π) unless a decimal is asked. " +
-    "Never present an unverified numeric/algebraic result as final.";
+    "Never present an unverified numeric/algebraic result as final." +
+    " PLAN THEN SOLVE: before computing, briefly lay out the steps and quantities you will compute, then execute " +
+    "them one at a time with explicit intermediate results — a skipped step is the most common cause of a wrong answer. " +
+    "CROSS-CHECK BY A SECOND METHOD: for any non-trivial result, confirm it a second, independent way (a different " +
+    "method, a limiting/special case, or a sanity estimate); if the two disagree, find and fix the error internally " +
+    "and show only the corrected final result. Do all of this verification WITHIN THIS SAME REPLY — never defer it to " +
+    "a later message. These correctness rules are ABSOLUTE and ENGINE-INDEPENDENT: apply the full plan → solve → " +
+    "verify → silently-correct discipline on EVERY answer, and never let quality drop because a lighter/backup model " +
+    "happens to be generating.";
   // In PLAN MODE, do NOT send buildRule/engineerRule — they push the model to emit the
   // full code/deliverable, which contradicts planSystem and caused the plan itself to be
   // written as a code block (then the Start pill was suppressed). planSystem alone governs.
   const planning = state.mode === "plan";
   // Difficulty calibration so the tiers are clearly ranked when GENERATING problems — Max the
   // absolute hardest, Ultra a deliberate notch below (both still error-free & fully solvable).
+  // SOLVE-BEFORE-YOU-ASK: a problem is only published if the model has ALREADY solved it cleanly to an
+  // exact answer — this is what stops "hard but broken/unsolvable/wrong" output on weaker engines.
+  const solveFirst =
+    " SOLVE-BEFORE-YOU-ASK: first solve the problem completely and correctly in your own private working; " +
+    "if your full solution is not clean, is ambiguous, or has no exact closed-form answer, DISCARD it and " +
+    "generate a different valid one — never publish a problem you could not cleanly solve. Difficulty must come " +
+    "from DEPTH of reasoning and combined concepts, NEVER from ambiguity, missing information, or an unsolvable " +
+    "setup. Then present the problem AND a fully-worked step-by-step solution ending in an exact final answer.";
   const genLevelRule =
     tier === "max"
-      ? " DIFFICULTY TIER — you are MAX, the TOP tier: when generating a problem, make it the ABSOLUTE HARDEST you can while keeping it valid and cleanly solvable (hardest-JEE-Advanced / Olympiad-final / Putnam level)."
+      ? " DIFFICULTY TIER — you are MAX, the TOP tier: when generating a problem, make it the ABSOLUTE HARDEST you can while keeping it valid and cleanly solvable (hardest-JEE-Advanced / Olympiad-final / Putnam level)." + solveFirst
       : tier === "ultra"
-      ? " DIFFICULTY TIER — you are ULTRA: when generating a problem, make it VERY HARD (advanced competition), but DELIBERATELY one notch EASIER than the Max tier so the difference is clear — still completely valid and error-free."
+      ? " DIFFICULTY TIER — you are ULTRA: when generating a problem, make it VERY HARD (advanced competition), but DELIBERATELY one notch EASIER than the Max tier so the difference is clear — still completely valid and error-free." + solveFirst
+      : tier === "pro"
+      ? " DIFFICULTY TIER — PRO: when generating a problem, make it solidly challenging (strong exam / early-competition level), fully valid and cleanly solvable." + solveFirst
       : "";
   const imageRule =
     " When MULTIPLE images are attached, examine EVERY image carefully and INDIVIDUALLY (one by one), " +
     "and use ALL of them to answer fully — never skip, merge, or ignore any attached image.";
   const tikzRule =
-    " GRAPHING A FUNCTION (INSTANT — PREFERRED): for a function graph / رسم بياني للدالة (y = f(x)), output a " +
-    "fenced code block tagged `plot` — it renders INSTANTLY as a real graph (zero delay, no engine). Put one or " +
+    " GRAPHING (ALWAYS USE `plot`, NEVER tikz): for ANY function/curve graph — cartesian (y=f(x)), POLAR " +
+    "(r=f(theta), rose/spiral/cardioid…), or PARAMETRIC (x=f(t),y=g(t)) — you MUST output a fenced `plot` block, " +
+    "NOT tikz. tikz graphs break in downloaded files; the `plot` block renders as a real graph everywhere " +
+    "(chat AND PDF). Put one or " +
     "more `y = <expression>` lines using EXPLICIT operators and standard functions, e.g.\n```plot\ny = x^2\n" +
     "domain: -4..4\n```\nSupported: + - * / ^, parentheses, and sin cos tan asin acos atan sinh cosh tanh exp ln " +
     "log(base10) sqrt cbrt abs floor ceil round; constants pi, e. For a normal graph use x (x^2, 2*x, sin(x)); " +
     "several `y = …` lines draw several curves. Add an optional `domain: a..b` line. " +
     "POLAR: write `r = <expr in theta>` (e.g. `r = 1 + cos(theta)`) with an optional `theta: 0..2*pi`. " +
     "PARAMETRIC: write BOTH `x = <expr in t>` and `y = <expr in t>` (e.g. `x = cos(t)` / `y = sin(2*t)`) with an optional `t: 0..2*pi`. " +
-    "OTHER DRAWINGS (geometry / diagrams — triangles, circles, vectors, number lines, shapes, NOT function graphs): " +
-    "output a fenced `tikz` block with a COMPLETE, self-contained \\begin{tikzpicture} … \\end{tikzpicture} — PLAIN " +
-    "TikZ only (NO \\documentclass / \\usepackage / pgfplots / external libraries; draw axes and labels manually " +
-    "with \\draw and \\node). " +
-    "A request to DRAW / sketch / graph is answered with a `plot` or `tikz` figure in a NORMAL chat reply — NEVER " +
+    "3D SURFACE: write `z = <expr in x,y>` (e.g. `z = sin(x)*cos(y)` or `z = x^2 - y^2`) with optional `x: -3..3` and `y: -3..3` — renders as an interactive isometric 3D surface. " +
+    "GEOMETRY / DIAGRAMS (triangles, circles, vectors, points, angles, polygons — NOT function graphs): ALSO use the SAME fenced `plot` block, " +
+    "NEVER tikz. Put one shape command per line — coordinates are `(x,y)`; options: `r=<radius>`, `color=<#hex>`, `dashed`, `fill`, and a \"label\" in quotes. Commands:\n" +
+    "`point (x,y) \"A\"` · `text (x,y) \"note\"` · `segment (x1,y1) (x2,y2)` · `line (x1,y1) (x2,y2)` (infinite) · `vector (x1,y1) (x2,y2)` (arrow) · " +
+    "`circle (cx,cy) r=R` · `ellipse (cx,cy) rx=A ry=B` · `arc (cx,cy) r=R 0..120` (degrees) · `angle (x1,y1) (vx,vy) (x2,y2) \"θ\"` (marks the angle at the middle vertex) · " +
+    "`triangle (x1,y1) (x2,y2) (x3,y3)` · `rectangle (x1,y1) (x2,y2)` (opposite corners) · `polygon (x1,y1) (x2,y2) (x3,y3) …`. Example:\n```plot\ncircle (0,0) r=3\npoint (0,0) \"O\"\ntriangle (-3,0) (3,0) (0,3) fill color=#237a68\nvector (0,0) (3,3) \"v\"\n```\n" +
+    "This renders natively (chat AND PDF) with a clean grid, true round circles, and equal aspect — you NEVER need tikz for geometry. " +
+    "A request to DRAW / sketch / graph is answered with a `plot` figure in a NORMAL chat reply — NEVER " +
     "by building an HTML/CSS/JS page, a <canvas>, or a website to draw it (build a web app ONLY if the user " +
     "EXPLICITLY asks for an interactive web app). Normal math still goes in $ … $ / $$ … $$ as usual.";
   const system = {
     role: "system",
-    content: model.persona + identityRule + langRule + mathRule + accuracyRule + codeRule + genLevelRule + imageRule + tikzRule + (planning ? "" : buildRule + engineerRule),
+    content: model.persona + identityRule + langRule + mathRule + accuracyRule + codeRule + genLevelRule + STEM_HARD_RULE + imageRule + tikzRule + (planning ? "" : buildRule + engineerRule),
   };
 
   // PLAN MODE: a per-turn system message (inserted right after the persona).
@@ -6318,10 +6718,18 @@ function authorSys(fmt, lang) {
     "\\begin{document}, and NEVER tell the user to compile or use Overleaf.";
   const tikzDocRule = (fmt === "pdf")
     ? " FIGURES / GRAPHS — YOU MUST INCLUDE THE ACTUAL FIGURE (never just describe 'the figure above'): " +
-      "For a FUNCTION GRAPH, output a fenced ```plot block — one or more `y = <expression>` lines (EXPLICIT operators + " +
-      "standard functions: x^2, 2*x, sin(x), exp(-x^2), sqrt(x), arctan(x), 1/(1+x^2); constant pi) plus an optional " +
-      "`domain: a..b` line; it renders INSTANTLY as a real graph in the document. For a GEOMETRIC figure (triangle, circle, " +
-      "vectors, number line…), output a fenced ```tikz block with a COMPLETE \\begin{tikzpicture} … \\end{tikzpicture}. " +
+      "For ANY function/curve GRAPH you MUST use a fenced ```plot block — NEVER tikz for graphs (tikz graphs break in the PDF; " +
+      "plot renders as a real graph in the document). CARTESIAN: `y = <expression>` lines (EXPLICIT operators + standard " +
+      "functions: x^2, 2*x, sin(x), exp(-x^2), sqrt(x), arctan(x), 1/(1+x^2); constant pi) + optional `domain: a..b`. " +
+      "POLAR (rose/cardioid/spiral): `r = <expr in theta>` (e.g. `r = 5*sin(6*theta)`) + optional `theta: 0..2*pi`. " +
+      "PARAMETRIC: BOTH `x = <expr in t>` and `y = <expr in t>` + optional `t: 0..2*pi`. " +
+      "3D SURFACE: `z = <expr in x,y>` (e.g. `z = sin(x)*cos(y)`) + optional `x: -3..3` / `y: -3..3`. " +
+      "GEOMETRY FIGURES (triangle, circle, vectors, points, angles, polygons, number lines): ALSO use a fenced ```plot block with shape commands — NEVER tikz for these. " +
+      "One shape per line, coords `(x,y)`, options `r=`, `color=#hex`, `dashed`, `fill`, \"label\". Commands: " +
+      "`point (x,y) \"A\"` · `segment (x1,y1) (x2,y2)` · `line …` · `vector (x1,y1) (x2,y2) \"v\"` · `circle (cx,cy) r=R` · `ellipse (cx,cy) rx=A ry=B` · " +
+      "`arc (cx,cy) r=R 0..120` · `angle (x1,y1) (vx,vy) (x2,y2) \"θ\"` · `triangle (x1,y1) (x2,y2) (x3,y3)` · `rectangle (x1,y1) (x2,y2)` · `polygon (…) (…) (…)`. " +
+      "Example:\n```plot\ncircle (0,0) r=3 fill\ntriangle (-3,0) (3,0) (0,3) color=#237a68\npoint (0,3) \"C\"\nangle (3,0) (0,0) (0,3) \"θ\"\n```\nThis renders as a real, professional figure in the PDF (true round circles, clean grid). " +
+      "ONLY for an electric CIRCUIT or a complex PHYSICS schematic (wires, resistors, fields) that shape commands can't express, output a fenced ```tikz block with a COMPLETE \\begin{tikzpicture} … \\end{tikzpicture}. " +
       "CRITICAL — a LIGHTWEIGHT in-browser TeX engine renders it, so keep it SIMPLE and MINIMAL or it FAILS and shows as raw " +
       "code: use ONLY basic \\draw / \\node / \\foreach / \\coordinate with plain options (thick, ->, red, dashed, circle, " +
       "rectangle); NO \\usepackage, NO pgfplots, NO tikz libraries (arrows.meta, positioning, calc…), NO \\text{} (use " +
@@ -6357,7 +6765,13 @@ function authorSys(fmt, lang) {
     "bulleted/numbered lists where they aid clarity, GitHub-style Markdown tables for any structured data, and blockquotes " +
     "for key takeaways. Keep a confident professional tone with smooth flow between sections, and finish with a concise " +
     "conclusion/summary when appropriate. Be complete and correct: if N items were requested, produce exactly N, each " +
-    "properly explained. ORGANIZATION — make it VERY tidy and easy to scan: a consistent heading hierarchy, related content " +
+    "properly explained. COUNT COMPLIANCE (hard rule): when the request names a number of items (questions/problems/" +
+    "integrals…), deliver EXACTLY that many — give each item its own numbered heading (e.g. '## المسألة 5' / '## Problem 5') " +
+    "with EXPLICIT numbers 1..N that never restart, and COUNT your items before finishing; a document with fewer items " +
+    "than requested is a FAILED task. SOLUTIONS INLINE (hard rule): when the request asks for solutions, put each item's " +
+    "COMPLETE worked step-by-step solution IMMEDIATELY after that item (problem 1 → its solution → problem 2 → its " +
+    "solution …, e.g. '**الحل:**' / '**Solution:**'), ending in an exact verified final answer — NEVER defer solutions " +
+    "to a separate section at the end." + STEM_HARD_RULE + " ORGANIZATION — make it VERY tidy and easy to scan: a consistent heading hierarchy, related content " +
     "grouped together, uniform spacing (NO orphan lines, NO stray punctuation on its own line), and — for an exam/worksheet — " +
     "clean question numbering with its parts (A/B/C…) and marks, each figure placed right beside the item it belongs to. " +
     "IMAGES: when the task provides REAL IMAGE URLS, embed EACH one at a contextually fitting spot as ![short description](URL) " +
@@ -6830,6 +7244,126 @@ function tightenInlineMath(md) {
   });
 }
 
+/* ═══ COUNT ENFORCEMENT — "10 questions" must yield 10, never 6 ═══════════════════════════════
+   The author model sometimes stops early (or gets truncated), delivering fewer items than the
+   user asked for. These helpers detect the requested count, count what was actually produced,
+   and CONTINUE the document with the missing items until the count is met. */
+
+/* The item count the user asked for ("10 integrals", "عشرة تكاملات", "ten hard questions") → N, or 0. */
+function parseRequestedItemCount(text) {
+  let s = String(text || "").replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d));
+  const NOUN = "(?:integrals?|problems?|questions?|exercises?|equations?|items?|mcqs?|تكاملات?|مسائل|مسأل[ةه]?|أسئلة|اسئلة|سؤال|سوال|تمارين|تمرين|معادلات?|معادلة|انتيكرل|انتقرل)";
+  // digits with a few adjectives allowed between: "10 challenging novel questions"
+  const dm = new RegExp("(\\d{1,4})\\s*(?:[A-Za-z؀-ۿ'’,-]+\\s+){0,6}?" + NOUN, "i").exec(s);
+  if (dm) { const n = parseInt(dm[1], 10); if (n >= 2 && n <= 2000) return n; }
+  // number words (longest first so "خمسة عشر" beats "خمسة")
+  const WORDS = { "خمسة عشر": 15, "اثنا عشر": 12, "إثنا عشر": 12, "عشرون": 20, "عشرين": 20, "ثلاثون": 30, "ثلاثين": 30, "أربعين": 40, "اربعين": 40, "خمسون": 50, "خمسين": 50, "مائة": 100, "مئة": 100, "ثلاثة": 3, "أربعة": 4, "اربعة": 4, "خمسة": 5, "ستة": 6, "سبعة": 7, "ثمانية": 8, "تسعة": 9, "عشرة": 10, "ثلاث": 3, "أربع": 4, "اربع": 4, "خمس": 5, "سبع": 7, "ثمان": 8, "تسع": 9, "عشر": 10, "ست": 6, twenty: 20, fifteen: 15, twelve: 12, eleven: 11, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10, fifty: 50, forty: 40, thirty: 30, hundred: 100, two: 2 };
+  const keys = Object.keys(WORDS).sort((a, b) => b.length - a.length);
+  for (const w of keys) {
+    const re = new RegExp("(?:^|[\\s،,])" + w.replace(/ /g, "\\s+") + "\\s+(?:[A-Za-z؀-ۿ'’,-]+\\s+){0,3}?" + NOUN, "i");
+    if (re.test(s)) return WORDS[w];
+  }
+  return 0;
+}
+
+/* How many items the generated markdown ACTUALLY contains — the highest explicit item label found
+   (headings like "## المسألة 7" / "### Problem 7" / "**Q7**"), falling back to numbered-line items,
+   then to keyword-heading count. Best-effort: 0 = "can't tell" (caller must not loop on 0). */
+function countDocItems(md) {
+  let s = String(md || "").replace(/```[\s\S]*?```/g, "").replace(/\$\$[\s\S]*?\$\$/g, "").replace(/[٠-٩]/g, (d) => "٠١٢٣٤٥٦٧٨٩".indexOf(d));
+  const KEY = "(?:ال)?(?:مسأل[ةه]|سؤال|تكامل|تمرين|مثال|problem|question|integral|exercise|example|q)";
+  let maxN = 0;
+  const scan = (re) => { let m; while ((m = re.exec(s))) { const n = parseInt(m[1], 10); if (n >= 1 && n <= 2000 && n > maxN) maxN = n; } };
+  scan(new RegExp("^#{1,6}[^\\n]*?" + KEY + "\\D{0,14}(\\d{1,4})", "gim"));           // "## المسألة 7" / "### Problem 7:"
+  scan(new RegExp("^\\s{0,3}(?:\\*\\*)?\\s*" + KEY + "\\s*[.#\\-–—]?\\s*(\\d{1,4})", "gim")); // "**Q7.**" at line start
+  // Arabic ORDINAL headings ("المسألة العاشرة") — models often number this way in Arabic docs.
+  const ORD = { "الأول": 1, "الاول": 1, "الأولى": 1, "الاولى": 1, "الثاني": 2, "الثانية": 2, "الثالث": 3, "الثالثة": 3, "الرابع": 4, "الرابعة": 4, "الخامس": 5, "الخامسة": 5, "السادس": 6, "السادسة": 6, "السابع": 7, "السابعة": 7, "الثامن": 8, "الثامنة": 8, "التاسع": 9, "التاسعة": 9, "العاشر": 10, "العاشرة": 10, "الحادي عشر": 11, "الحادية عشرة": 11, "الثاني عشر": 12, "الثانية عشرة": 12, "الثالث عشر": 13, "الثالثة عشرة": 13, "الرابع عشر": 14, "الرابعة عشرة": 14, "الخامس عشر": 15, "الخامسة عشرة": 15, "السادس عشر": 16, "السادسة عشرة": 16, "السابع عشر": 17, "السابعة عشرة": 17, "الثامن عشر": 18, "الثامنة عشرة": 18, "التاسع عشر": 19, "التاسعة عشرة": 19, "العشرون": 20 };
+  let m2;
+  const ordRe = /^#{1,6}[^\n]*?(?:المسألة|السؤال|التكامل|التمرين|المثال)\s+(ال[؀-ۿ]+(?:\s+عشرة?)?)/gim;
+  while ((m2 = ordRe.exec(s))) { const n = ORD[m2[1].trim()]; if (n && n > maxN) maxN = n; }
+  if (maxN) return maxN;
+  // fallback: explicit numbered lines "7." / "7)" (max label — markdown lists that restart at 1 undercount,
+  // which is safe: enforcement stops when it can't measure progress)
+  scan(/^\s{0,3}(?:\*\*)?(\d{1,4})(?:\*\*)?\s*[.)\-:]\s+\S/gim);
+  if (maxN) return maxN;
+  const heads = s.match(new RegExp("^#{1,6}[^\\n]*" + KEY, "gim"));
+  return heads ? heads.length : 0;
+}
+
+/* Did the user explicitly ask for SOLUTIONS with their items? */
+function requestWantsSolutions(text) {
+  return /مع\s*الحلول|بالحلول|مع\s*الحل|وحلول(?:ها)?|with\s+(?:full\s+|complete\s+|worked\s+|step[\s-]*by[\s-]*step\s+)?solutions?|and\s+solutions?|solved\b/i.test(String(text || ""));
+}
+/* How many worked-solution blocks the doc contains ("## الحل", "**Solution 3:**", "حل المسألة ٤"…). */
+function countDocSolutions(md) {
+  const s = String(md || "").replace(/```[\s\S]*?```/g, "");
+  let n = 0;
+  n += (s.match(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\s*(?:الحل|حل\s*(?:المسألة|السؤال|التمرين|التكامل))/g) || []).length;
+  n += (s.match(/(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*)?\s*Solution/gi) || []).length;
+  return n;
+}
+/* Splice `extra` into `doc` just BEFORE a trailing conclusion section (if any) — else append.
+   (No \b in the regex — \b never matches adjacent to Arabic letters in JS.) */
+function spliceBeforeConclusion(doc, extra) {
+  const concM = /\n#{1,4}\s*(?:خاتمة|الخاتمة|خلاصة|الخلاصة|conclusion|summary)[^\n]*(?:\n|$)/i.exec(doc);
+  let head = doc, tail = "";
+  if (concM && concM.index > doc.length * 0.5) { head = doc.slice(0, concM.index); tail = doc.slice(concM.index); }
+  return head.replace(/\s*$/, "") + "\n\n" + extra + tail;
+}
+
+/* If the doc has fewer items than requested, CONTINUE it (same format/language) until complete.
+   `call(messages)` = the pipeline's own model caller. Up to 4 continuation rounds; stops on no progress.
+   Then, if the user asked for SOLUTIONS and the doc has (almost) none, appends a full solutions pass. */
+async function ensureDocItemCount(doc, requested, reqText, sysContent, call, signal, onStage) {
+  if (!requested || requested < 2) return doc;
+  const wantsSol = requestWantsSolutions(reqText);
+  for (let round = 0; round < 4; round++) {
+    if (signal && signal.aborted) break;
+    const have = countDocItems(doc);
+    if (!have || have >= requested) break;               // 0 = unmeasurable → never loop blindly
+    if (onStage) try { onStage("content"); } catch (_) {}
+    let cont = "";
+    try {
+      cont = (await call([
+        { role: "system", content: sysContent },
+        { role: "user", content: "REQUEST:\n" + String(reqText || "").slice(0, 4000) +
+          "\n\nTHE DOCUMENT SO FAR (its ending is shown — match its language, heading style, numbering and difficulty EXACTLY):\n…" + doc.slice(-6000) +
+          "\n\nINCOMPLETE: the user asked for " + requested + " items but the document contains ONLY " + have + ". " +
+          "CONTINUE the document with the MISSING items — numbers " + (have + 1) + " through " + requested + " — same format, same numbering scheme continued (never restart at 1), same language. " +
+          (wantsSol ? "The user asked for SOLUTIONS: include the COMPLETE worked step-by-step solution immediately after EACH new item, ending in an exact verified final answer. " : "") +
+          "Output ONLY the new items: no title, no introduction, no conclusion, no repetition of existing items, no commentary." },
+      ])) || "";
+    } catch (e) { if (signal && signal.aborted) throw e; break; }
+    const cleaned = stripFileMetaBlock(String(cont)).replace(/^\s*(?:of course|sure|بالطبع|إليك|حسنًا)[^\n]*\n/i, "").trim();
+    if (!cleaned) break;
+    const merged = spliceBeforeConclusion(doc, cleaned);
+    if (countDocItems(merged) <= have) break;            // no measurable progress → stop
+    doc = merged;
+  }
+  // SOLUTIONS ENFORCEMENT — "with solutions" means every problem gets a worked solution. If the doc
+  // has questions but (almost) no solutions (the exact 2-questions-0-solutions failure), one pass
+  // writes the complete solutions for ALL items and splices them in before the conclusion.
+  if (wantsSol && !(signal && signal.aborted)) {
+    const items = countDocItems(doc);
+    const haveSol = countDocSolutions(doc);
+    if (items >= 2 && haveSol < items) {                 // EVERY problem must have a worked solution
+      if (onStage) try { onStage("content"); } catch (_) {}
+      let sol = "";
+      try {
+        sol = (await call([
+          { role: "system", content: sysContent },
+          { role: "user", content: "REQUEST:\n" + String(reqText || "").slice(0, 3000) +
+            "\n\nTHE DOCUMENT (the user explicitly asked for a SOLUTION to EVERY problem; " + haveSol + " of the " + items + " problems have one — the rest are MISSING theirs):\n" + doc.slice(-16000) +
+            "\n\nWrite the COMPLETE, fully-worked, step-by-step solutions for the problems that do NOT already have a solution in the document above (skip the ones already solved) — one clearly-labelled solution per problem, numbered to MATCH its problem ('## Solution 2' / '## حل المسألة 2', in the document's language), every step justified, each ending in an exact VERIFIED final answer (substitute back / differentiate the antiderivative to check). Output ONLY these solutions, starting with a '## Solutions' / '## الحلول' heading." },
+        ])) || "";
+      } catch (_) { sol = ""; }
+      const solClean = stripFileMetaBlock(String(sol)).trim();
+      if (solClean && countDocSolutions(solClean) >= 1) doc = spliceBeforeConclusion(doc, solClean);
+    }
+  }
+  return doc;
+}
+
 async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) {
   // Files ALWAYS use the general document model (gpt-oss = "pro"), never the coder
   // (Ultra = qwen3-coder) — a coding model turns "make a PDF" into an HTML website.
@@ -6930,10 +7464,17 @@ async function runFileAgentPipeline(convo, fmt, lang, tierKey, signal, onStage) 
   const outline = parsed.body.trim();
   // 2) Author — full content
   onStage("content");
-  const content = (await callAgentText([
+  let content = (await callAgentText([
     { role: "system", content: authorSys(fmt, lang) },
     { role: "user", content: "REQUEST:\n" + userText + "\n\nFILE PLAN:\n" + metaBlock + "\n" + outline + "\n\nWrite the full content now, following the plan exactly." },
   ], tierKey, signal)).trim();
+  // 2b) COUNT ENFORCEMENT — "10 questions" must yield 10, not 6: if the author stopped early
+  // (or was truncated), auto-continue with the missing items until the requested count is met.
+  const requestedN = parseRequestedItemCount(userText);
+  if (requestedN >= 2 && requestedN <= 400 && fmt !== "xlsx" && fmt !== "csv" && fmt !== "pptx") {
+    content = await ensureDocItemCount(content, requestedN, userText, authorSys(fmt, lang),
+      (msgs) => callAgentText(msgs, tierKey, signal), signal, onStage);
+  }
   // 3) Finisher — only re-process via the model when the draft has real problems
   // (stray code/HTML, preamble, or no proper title); otherwise assemble in CODE so
   // long content (e.g. 100 equations) is never truncated or dropped.
@@ -9970,17 +10511,17 @@ async function buildClarifyingQuestions(task, lang, signal) {
 const AGENT_QUALITY =
   " You are a world-class domain expert for THIS task — a tenured professor for math/physics/chemistry/science, a published author for Arabic/English writing, a principal engineer for code. Work at that level, always." +
   " DEPTH: every step's output is a COMPLETE specialist section — full coverage of its subtopic, correct terminology, concrete worked examples, precise reasoning, clean structure with clear headings. Never an outline, a summary of what you 'would' write, or a stub." +
-  " CORRECTNESS: solve everything end-to-end and VERIFY before stating a result — differentiate an antiderivative back to the integrand, substitute values into an identity/equation, check every endpoint, singularity, unit and edge case, and re-derive any number you are unsure of. Never assert an unverified result. Give EXACT closed forms (fractions, radicals, π, e, symbolic) unless a decimal is requested." +
+  " CORRECTNESS: solve everything end-to-end and VERIFY before stating a result — differentiate an antiderivative back to the integrand, substitute values into an identity/equation, check every endpoint, singularity, unit and edge case, and re-derive any number you are unsure of. Never assert an unverified result. Give EXACT closed forms (fractions, radicals, π, e, symbolic) unless a decimal is requested. For any problem/exercise/question you GENERATE, first solve it fully as a hidden answer key; if your own solution is not clean, is ambiguous, or has no exact closed-form answer, DISCARD it and produce a different valid one — never publish a problem you could not cleanly solve. Confirm every non-trivial result a SECOND way (a different method or a special/limiting case). These correctness rules hold on EVERY engine — quality must not drop on a lighter/backup model." +
   " SELF-CONSISTENCY: honour every definition, symbol, notation and claim established in earlier steps; contradict nothing already written." +
   " REAL CONTENT ONLY (absolute): never output 'TODO', 'lorem', '...', '(details omitted)', '(similar to above)', 'left as an exercise', placeholder names, or any promise of content instead of the content itself. If a part is long, write all of it." +
-  " FORMATTING: ALL math in valid, BALANCED KaTeX ($…$ inline, $$…$$ for standalone equations only), units and words inside \\text{} with thin spaces (e.g. $9.8\\,\\text{m/s}^2$). Function graphs as a fenced ```plot block (lines `y = <expr>` with explicit operators + optional `domain: a..b`). Geometric/physics figures as a SIMPLE fenced ```tikz block (explicit coordinates, basic \\draw/\\node only). Code in fenced blocks with the language tag." +
+  " FORMATTING: ALL math in valid, BALANCED KaTeX ($…$ inline, $$…$$ for standalone equations only), units and words inside \\text{} with thin spaces (e.g. $9.8\\,\\text{m/s}^2$). Function graphs as a fenced ```plot block (lines `y = <expr>` with explicit operators + optional `domain: a..b`; also polar `r=f(theta)`, parametric `x=f(t)`/`y=g(t)`, 3D `z=f(x,y)`). GEOMETRY figures (triangles, circles, vectors, points, angles, polygons) ALSO as a fenced ```plot block with shape commands — `circle (cx,cy) r=R`, `triangle (x1,y1) (x2,y2) (x3,y3)`, `vector (x1,y1) (x2,y2)`, `point (x,y) \"A\"`, `angle (a) (v) (b) \"θ\"`, `segment`/`line`/`rectangle`/`polygon`/`arc`/`ellipse` — NEVER tikz for geometry. Reserve ```tikz ONLY for electric circuits / complex physics schematics. Code in fenced blocks with the language tag." +
   " Deliver the work itself — polished and final, no meta commentary or apologies.";
 /* Per-domain execution guidance so each answer-mode step is done like a specialist. */
 const DOMAIN_GUIDE = {
   math: " MATH MODE: state given/goal, then a rigorous step-by-step derivation where EVERY line follows from the previous with the rule named (no skipped algebra). Define notation, note domain/edge cases, verify the result (substitute back or sanity-check units/limits). Include at least one fully worked example and, where useful, a second method as a cross-check. Give the final answer boxed as $\\boxed{...}$.",
   science: " PHYSICS/CHEM/SCIENCE MODE: name the governing law/principle first, then derive symbolically BEFORE plugging numbers. Carry UNITS through every step and check dimensional consistency; give the answer to correct significant figures with units. State assumptions and regimes of validity. Chemistry: balanced equations, correct states/charges, mechanisms with electron-flow described. Draw the setup/free-body/energy diagram as a SIMPLE ```tikz block. Add a short 'why this makes physical sense' check.",
   writing: " WRITING MODE (essays/literature/language, EN or AR): open with a clear thesis, develop it across well-structured paragraphs each with a topic sentence + evidence + analysis, and close with a synthesis (not a restatement). Use precise, varied, register-appropriate vocabulary and real examples/quotations. Arabic: فصحى سليمة مع ضبط ما يلزم وترابط منطقي. Aim for genuine depth, never a thin outline.",
-  exam: " EXAM MODE: produce a real question SET spanning easy→medium→hard (label each with difficulty and marks). Mix formats (MCQ, short-answer, problem, proof/essay) as fits the subject, keep questions unambiguous and non-repetitive, then give a COMPLETE separate ANSWER KEY with full worked solutions/rationale — not just final letters. NOVELTY: when the user asks for NEW/novel/original problems, CONSTRUCT each one yourself (fresh functions, numbers, structures and scenarios — never textbook classics or famous competition problems restated), and make each problem combine 2-3 distinct ideas/techniques so it cannot be pattern-matched. DIFFICULTY CALIBRATION: honour the requested level exactly (olympiad/JEE-advanced means genuinely hard multi-step problems, not routine drills) while staying SOLVABLE with the allowed tools — verify each problem end-to-end yourself before including it, and respect every exclusion the user states (no complex analysis, no non-elementary integrals…).",
+  exam: " EXAM MODE: DEFAULT DIFFICULTY — when the subject is math/physics/chemistry (or any quantitative science) and the user did NOT explicitly ask for an easy/basic level, the set must be GENUINELY HARD overall (strong competition / JEE-Advanced calibre): multi-concept, multi-step, tricky ideas, no routine textbook drills — and every problem NOVEL, UNIQUE and DISTINCTIVE (fresh structures/numbers/scenarios you construct yourself, never known classics or reworded book problems). Produce a real question SET (label each with difficulty and marks). Mix formats (MCQ, short-answer, problem, proof/essay) as fits the subject, keep questions unambiguous and non-repetitive, then give a COMPLETE separate ANSWER KEY with full worked solutions/rationale — not just final letters. NOVELTY: when the user asks for NEW/novel/original problems, CONSTRUCT each one yourself (fresh functions, numbers, structures and scenarios — never textbook classics or famous competition problems restated), and make each problem combine 2-3 distinct ideas/techniques so it cannot be pattern-matched. DIFFICULTY CALIBRATION: honour the requested level exactly (olympiad/JEE-advanced means genuinely hard multi-step problems, not routine drills) while staying SOLVABLE with the allowed tools — verify each problem end-to-end yourself before including it (if your own worked solution is not clean and exact, REPLACE that problem with one you can solve cleanly), and respect every exclusion the user states (no complex analysis, no non-elementary integrals…).",
   knowledge: " KNOWLEDGE MODE: lead with the direct, correct answer, then explain the why with concrete facts, mechanisms, dates/figures, and a short example or analogy. Distinguish established fact from interpretation; if a claim is uncertain, say so. Structure with clear headings/lists so it is scannable."
 };
 const DEPTH_MANDATE = " DEPTH MANDATE: this step must be genuinely thorough and self-contained — full coverage of its topic with derivations/examples/evidence, not a summary. Never abbreviate with 'and so on' or 'similar for the rest'; write every part out in full.";
@@ -10790,7 +11331,20 @@ async function runAgentAssistant(chat, tier, replyLang, resumeRun) {
       } else if (run.mode === "doc" && run.steps.some((s) => s.s === "done" && s.out)) {
         // Document → the real downloadable file card (PDF/Word…), with the math/latex cleanup and a
         // fitting professional TEMPLATE (exam→ministry, thesis→academic…).
-        const docBody = run.steps.filter((s) => s.s === "done" && s.out).map((s) => s.out).join("\n\n");
+        let docBody = run.steps.filter((s) => s.s === "done" && s.out).map((s) => s.out).join("\n\n");
+        // COUNT ENFORCEMENT — the assembled document must contain every requested item ("10 questions"
+        // → 10). If the steps under-delivered, auto-continue with the missing ones before delivery.
+        try {
+          const reqN = parseRequestedItemCount(task);
+          if (reqN >= 2 && reqN <= 400) {
+            const docLangRule = replyLang === "ar"
+              ? " LANGUAGE: the document is in ARABIC — the new items must be in Arabic too."
+              : " LANGUAGE: the document is in ENGLISH — the new items must be in English too.";
+            docBody = await ensureDocItemCount(docBody, reqN, task,
+              "You are Firas Agent completing a document that is missing items." + AGENT_QUALITY + (DOMAIN_GUIDE[domainOf(task)] || "") + docLangRule,
+              (msgs) => agentCall(msgs, "max", controller.signal), controller.signal, null);
+          }
+        } catch (_) { /* enforcement is best-effort — never lose the doc */ }
         const tpl = docTemplateFor(task);
         const baseName = (run.title || task.slice(0, 40)).replace(/[\\/:*?"<>|]/g, " ").trim();
         const meta = { filename: baseName, title: run.title || task.slice(0, 60), subtitle: "", theme: (tpl === "corporate" || tpl === "ministry" ? "navy" : "teal") };
