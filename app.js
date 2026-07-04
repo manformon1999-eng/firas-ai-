@@ -10551,6 +10551,14 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
     + (ctx.history ? "\n\nCONVERSATION SO FAR (this request CONTINUES it — stay consistent with everything already agreed/built):\n" + ctx.history : "")
     + (ctx.prevRunTitle ? "\n\nPREVIOUS COMPLETED TASK: " + ctx.prevRunTitle : "");
   let taskCtx = task + convoCtx;
+  // ATTACHED FILE (PDF/code/text) — the FULL extracted text, carried outside the task string so the
+  // short task slices in the prompts below never cut it off. Injected as a labelled source block
+  // into planning and every content call — the agent reads uploaded files exactly like normal chat.
+  const srcDoc = ctx.fileText ? String(ctx.fileText) : "";
+  const srcBlock = (cap) => srcDoc
+    ? "\n\n=== محتوى الملف المرفق (المصدر الأساسي — اقرأه بالكامل وابنِ العمل منه) / ATTACHED FILE CONTENT (primary source — read it fully and ground the work in it) ===\n"
+      + (srcDoc.length > cap ? srcDoc.slice(0, cap) + "\n[... truncated ...]" : srcDoc)
+    : "";
   const ar = replyLang === "ar";
   // The deliverable MUST match the language the user wrote in — content AND every human-readable
   // string (UI labels, titles, headings, captions, chart/table labels, filenames). Only code
@@ -10628,7 +10636,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
   try {
     const raw = await agentCall([
       { role: "system", content: plannerSysTxt },
-      { role: "user", content: taskCtx.slice(0, 5500) + (ctx.prevProj ? "\n\nEXISTING PROJECT FILES:\n" + ctx.prevProj.files.map((f) => "- " + f.path + " (" + (f.content || "").length + " chars)").join("\n") : "") },
+      { role: "user", content: taskCtx.slice(0, 5500) + srcBlock(20000) + (ctx.prevProj ? "\n\nEXISTING PROJECT FILES:\n" + ctx.prevProj.files.map((f) => "- " + f.path + " (" + (f.content || "").length + " chars)").join("\n") : "") },
     ], "max", signal);
     const jm = raw.match(/\{[\s\S]*\}/);
     plan = jm ? JSON.parse(jm[0]) : null;
@@ -10677,17 +10685,17 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
     const imgSpec = (run._images && run._images.length) ? "\n\nREAL PHOTO URLS — use these EXACT https URLs for the hero and section/card photos where the design calls for imagery (they are real, relevant, reliable). Give each <img> width+height+object-fit:cover and an onerror hide; do NOT invent other image paths:\n" + run._images.map((u, i) => (i + 1) + ". " + u).join("\n") : "";
     if (st.kind === "design") {
       sysTxt = "You are Firas Agent's ART DIRECTOR + PRODUCT DESIGNER. Produce a COMPACT but complete DESIGN & PRODUCT SPEC the build will follow exactly: 1) visual identity (palette with hex values, typography pairing, spacing scale, border-radius/shadow style, animation personality), 2) full list of pages/sections with what each contains, 3) reusable components (buttons, cards, nav, forms…) with their look, 4) data model / interactive behaviors, 5) the image/asset strategy PER SECTION obeying the VISUAL POLICY. Make it DISTINCTIVE and premium — not a generic bootstrap look. Concise bullet spec, no code, no preamble." + VISUAL_POLICY + langRule;
-      usrTxt = "THE TASK:\n" + task.slice(0, 3000) + "\n\nPLANNED FILES:\n" + run.steps.filter((s) => s.file).map((s) => "- " + s.file + " — " + s.title).join("\n");
+      usrTxt = "THE TASK:\n" + task.slice(0, 3000) + srcBlock(6000) + "\n\nPLANNED FILES:\n" + run.steps.filter((s) => s.file).map((s) => "- " + s.file + " — " + s.title).join("\n");
     } else if (run.mode === "project") {
       const built = run.steps.filter((s) => s.s === "done" && s.file).map((s) => "===== " + s.file + " (already built) =====\n" + stripToCode(s.out).slice(0, 1800)).join("\n\n").slice(0, 10000);
       sysTxt = "You are Firas Agent building ONE FILE of a professional multi-file project. Output ONLY the COMPLETE, FINAL content of the file `" + st.file + "` in ONE fenced code block — no commentary, no omissions, never stop mid-file. PRODUCTION-GRADE; stay perfectly CONSISTENT with the design system and the other files (ids, classes, imports, paths)." + SIZE_MANDATE + TECH_BRAIN + (isWebFile ? VISUAL_POLICY : "") + langRule;
       const prevFile = ctx.prevProj ? (ctx.prevProj.files.find((x) => x.path === st.file) || null) : null;
       const siblings = run.steps.filter((s) => s.s === "done" && s.file && s.file !== st.file && s.kind !== "design").map((s) => { const c = stripToCode(s.out); const ids = [...c.matchAll(/id=["']([\w-]+)["']/g)].map((m) => m[1]); const cls = [...c.matchAll(/class=["']([^"']+)["']/g)].flatMap((m) => m[1].split(/\s+/)).filter(Boolean); const fns = [...c.matchAll(/(?:function|const|let|var)\s+([A-Za-z_$][\w$]*)/g)].map((m) => m[1]); return "• " + s.file + " → ids[" + [...new Set(ids)].slice(0, 40).join(",") + "] classes[" + [...new Set(cls)].slice(0, 60).join(",") + "] symbols[" + [...new Set(fns)].slice(0, 40).join(",") + "]"; }).join("\n").slice(0, 4000);
-      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + designSpec + (/\.html?$/i.test(st.file || "") ? imgSpec : "") + "\n\nPROJECT FILES (plan):\n" + run.steps.filter((s) => s.file).map((s) => "- " + s.file + " — " + s.title).join("\n") + (built ? "\n\nFILES ALREADY BUILT:\n" + built : "") + (siblings ? "\n\nCROSS-FILE CONTRACT — this file MUST reference these EXACT ids/classes/symbols the sibling files already expose; use them precisely, and only ADD new ones, never rename an existing shared one:\n" + siblings : "") + (prevFile ? "\n\nCURRENT VERSION OF `" + st.file + "` (EVOLVE it — apply the new request, keep everything that should stay):\n" + String(prevFile.content || "").slice(0, 22000) : "") + "\n\nBUILD THIS FILE NOW, COMPLETE: " + st.file;
+      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + srcBlock(15000) + designSpec + (/\.html?$/i.test(st.file || "") ? imgSpec : "") + "\n\nPROJECT FILES (plan):\n" + run.steps.filter((s) => s.file).map((s) => "- " + s.file + " — " + s.title).join("\n") + (built ? "\n\nFILES ALREADY BUILT:\n" + built : "") + (siblings ? "\n\nCROSS-FILE CONTRACT — this file MUST reference these EXACT ids/classes/symbols the sibling files already expose; use them precisely, and only ADD new ones, never rename an existing shared one:\n" + siblings : "") + (prevFile ? "\n\nCURRENT VERSION OF `" + st.file + "` (EVOLVE it — apply the new request, keep everything that should stay):\n" + String(prevFile.content || "").slice(0, 22000) : "") + "\n\nBUILD THIS FILE NOW, COMPLETE: " + st.file;
     } else if (run.mode === "codefile") {
       const built = prevOutline();
       sysTxt = "You are Firas Agent building ONE SECTION of a single-file deliverable (all sections get merged into ONE complete file at the end). Output ONLY this section's code in ONE fenced code block — consistent with the design system and the sections already built (same ids/classes)." + SIZE_MANDATE + TECH_BRAIN + (isWebFile ? VISUAL_POLICY : "") + langRule;
-      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + designSpec + imgSpec + (ctx.prevCode ? "\n\nTHE CURRENT FILE BEING EVOLVED (head):\n" + ctx.prevCode.slice(0, 8000) : "") + "\n\nFULL PLAN:\n" + planList + (built ? "\n\nSECTIONS ALREADY BUILT (stay consistent — do not repeat):\n" + built : "") + "\n\nBUILD SECTION " + (i + 1) + " NOW: " + st.title;
+      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + srcBlock(15000) + designSpec + imgSpec + (ctx.prevCode ? "\n\nTHE CURRENT FILE BEING EVOLVED (head):\n" + ctx.prevCode.slice(0, 8000) : "") + "\n\nFULL PLAN:\n" + planList + (built ? "\n\nSECTIONS ALREADY BUILT (stay consistent — do not repeat):\n" + built : "") + "\n\nBUILD SECTION " + (i + 1) + " NOW: " + st.title;
     } else if (run._deck) {
       // ④ DECK author — this step writes the SLIDES for one section, in the exact markdown the PPTX
       // engine parses: a '## Section' divider, then '### Slide' + 3-5 short bullets, optional one
@@ -10700,7 +10708,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
         "• When a slide presents NUMBERS/statistics/comparisons/trends, add ONE line: Chart: {\"type\":\"bar|line|doughnut\",\"title\":\"…\",\"labels\":[\"…\"],\"data\":[numbers]} — it renders as an ANIMATED professional chart (and a real chart in PowerPoint). Use REAL plausible values; 1-3 chart slides per deck. A slide has a chart OR an image, never both.\n" +
         "• Add a 'Notes: <1-2 sentences the speaker says>' line to most slides — becomes hidden PowerPoint speaker notes.\n" +
         "Make the bullets specific and insightful, never filler. No preamble, no metadata, ONLY the slides." + AGENT_QUALITY.replace(/ FORMATTING:[\s\S]*$/, "") + langRule;
-      usrTxt = "PRESENTATION TOPIC:\n" + taskCtx.slice(0, 3500) + "\n\nFULL DECK OUTLINE:\n" + planList + imgList + (prevOutline() ? "\n\nSECTIONS ALREADY WRITTEN (do not repeat their slides):\n" + prevOutline() : "") + "\n\nWRITE THE SLIDES FOR THIS SECTION NOW: " + st.title;
+      usrTxt = "PRESENTATION TOPIC:\n" + taskCtx.slice(0, 3500) + srcBlock(20000) + "\n\nFULL DECK OUTLINE:\n" + planList + imgList + (prevOutline() ? "\n\nSECTIONS ALREADY WRITTEN (do not repeat their slides):\n" + prevOutline() : "") + "\n\nWRITE THE SLIDES FOR THIS SECTION NOW: " + st.title;
     } else {
       let dom = domainOf(st.title + " " + task);
       if (dom === "knowledge" && st.kind === "solve") dom = "math";
@@ -10708,7 +10716,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
       st.dom = dom;
       const MEGA_MANDATE = run._mega ? " MEGA-BOOK CHAPTER: this is one chapter of a very large reference book — write it EXTREMELY long and complete (aim for 3500-5000+ words of real content: full explanations, many worked examples, tables, subsections). Never compress; length is a requirement." : "";
       sysTxt = "You are Firas Agent EXECUTING ONE STEP of a bigger plan. Produce the COMPLETE, final content for THIS step only — it will be assembled with the other steps into the deliverable." + AGENT_QUALITY + DEPTH_MANDATE + MEGA_MANDATE + (DOMAIN_GUIDE[dom] || "") + langRule;
-      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + "\n\nFULL PLAN:\n" + planList + (prevOutline() ? "\n\nALREADY COMPLETED (context — do not repeat):\n" + prevOutline() : "") + (searchCtx ? "\n\nFRESH WEB RESULTS (cite [1][2] where used):\n" + searchCtx : "") + "\n\nEXECUTE STEP " + (i + 1) + " NOW: " + st.title;
+      usrTxt = "THE TASK:\n" + taskCtx.slice(0, 4500) + srcBlock(60000) + "\n\nFULL PLAN:\n" + planList + (prevOutline() ? "\n\nALREADY COMPLETED (context — do not repeat):\n" + prevOutline() : "") + (searchCtx ? "\n\nFRESH WEB RESULTS (cite [1][2] where used):\n" + searchCtx : "") + "\n\nEXECUTE STEP " + (i + 1) + " NOW: " + st.title;
     }
     try {
       st.out = await agentCall([
@@ -10809,7 +10817,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
         try {
           const redone = await agentCall([
             { role: "system", content: "You are Firas Agent REDOING one step after review." + AGENT_QUALITY + (DOMAIN_GUIDE[st.dom] || "") + langRule },
-            { role: "user", content: "THE TASK:\n" + task.slice(0, 3000) + "\n\nREVIEWER'S FIXES TO APPLY:\n" + String(verdict.notes || "").slice(0, 1500) + "\n\nREDO STEP " + n + " COMPLETELY: " + st.title + "\n\nPREVIOUS (flawed) OUTPUT:\n" + prev.slice(0, 5000) },
+            { role: "user", content: "THE TASK:\n" + task.slice(0, 3000) + srcBlock(15000) + "\n\nREVIEWER'S FIXES TO APPLY:\n" + String(verdict.notes || "").slice(0, 1500) + "\n\nREDO STEP " + n + " COMPLETELY: " + st.title + "\n\nPREVIOUS (flawed) OUTPUT:\n" + prev.slice(0, 5000) },
           ], stepTier(st.kind), signal);
           // take the redo only if it isn't a regression (≥60% of prior length, or prior was a stub)
           if (redone && (redone.length >= prev.length * 0.6 || prev.length < 400)) st.out = redone;
@@ -10827,7 +10835,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
     try {
       st.out = await agentCall([
         { role: "system", content: "You are Firas Agent." + AGENT_QUALITY + (DOMAIN_GUIDE[st.dom] || "") + langRule },
-        { role: "user", content: "TASK:\n" + task.slice(0, 3000) + "\n\nEXECUTE THIS PART COMPLETELY: " + st.title },
+        { role: "user", content: "TASK:\n" + task.slice(0, 3000) + srcBlock(30000) + "\n\nEXECUTE THIS PART COMPLETELY: " + st.title },
       ], "max", signal);
       st.s = "done";
     } catch (_) { st.s = "fail"; }
@@ -10844,7 +10852,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
         try {
           const check = await agentCall([
             { role: "system", content: "You are Firas Agent's independent MATH/SCIENCE CHECKER. FIRST re-derive the final result(s) of the given solution yourself, from scratch. THEN compare with the solution. If its final results and key steps are correct, reply with exactly: OK. If ANYTHING is wrong (a value, a sign, units, a skipped condition), reply with the FULL corrected solution — complete, same structure and language, valid KaTeX — and nothing else." },
-            { role: "user", content: "TASK CONTEXT:\n" + task.slice(0, 1200) + "\n\nSTEP: " + st.title + "\n\nSOLUTION TO CHECK:\n" + st.out.slice(0, 9000) },
+            { role: "user", content: "TASK CONTEXT:\n" + task.slice(0, 1200) + srcBlock(8000) + "\n\nSTEP: " + st.title + "\n\nSOLUTION TO CHECK:\n" + st.out.slice(0, 9000) },
           ], "max", signal);
           run.stats.checks++;
           const v = (check || "").trim();
@@ -10865,7 +10873,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
         try {
           const richer = await agentCall([
             { role: "system", content: "You are Firas Agent EXPANDING a step whose output is too thin for the quality bar. Rewrite it substantially DEEPER and more complete — a full specialist section (more worked detail, more examples, more precision), keeping everything that was correct." + AGENT_QUALITY + DEPTH_MANDATE + (DOMAIN_GUIDE[st.dom] || "") + langRule },
-            { role: "user", content: "THE TASK:\n" + task.slice(0, 1500) + "\n\nSTEP: " + st.title + "\n\nCURRENT (too thin) OUTPUT:\n" + st.out + "\n\nREWRITE IT NOW, substantially deeper." },
+            { role: "user", content: "THE TASK:\n" + task.slice(0, 1500) + srcBlock(15000) + "\n\nSTEP: " + st.title + "\n\nCURRENT (too thin) OUTPUT:\n" + st.out + "\n\nREWRITE IT NOW, substantially deeper." },
           ], "max", signal);
           if (richer && richer.length > st.out.length) st.out = richer;
         } catch (_) { /* keep the original */ }
@@ -11123,7 +11131,7 @@ async function runAgentTask(chat, aiMsg, task, replyLang, signal, onUpdate, ctx,
           if (st) {
             const better = await agentCall([
               { role: "system", content: "You are Firas Agent RAISING one section to excellence after an examiner flagged weaknesses. Rewrite it fixing every noted weakness — deeper, more precise, more complete — keeping everything that was correct." + AGENT_QUALITY + (DOMAIN_GUIDE[st.dom] || "") + langRule },
-              { role: "user", content: "THE TASK:\n" + task.slice(0, 1200) + "\n\nEXAMINER'S WEAKNESSES:\n" + notes + "\n\nSTEP: " + st.title + "\n\nCURRENT OUTPUT:\n" + st.out.slice(0, 12000) },
+              { role: "user", content: "THE TASK:\n" + task.slice(0, 1200) + srcBlock(10000) + "\n\nEXAMINER'S WEAKNESSES:\n" + notes + "\n\nSTEP: " + st.title + "\n\nCURRENT OUTPUT:\n" + st.out.slice(0, 12000) },
             ], "max", signal);
             if (better && better.length >= st.out.length * 0.7) st.out = better;
           }
@@ -11193,13 +11201,24 @@ async function runAgentAssistant(chat, tier, replyLang, resumeRun) {
   // ⑤ ATTACHMENTS — the Agent now READS what the user attached (screenshots/designs, PDFs, text files)
   // and folds their content into the task, so both planning and building actually USE them. Screenshot
   // + a build request ("مثل هذا الموقع" / "rebuild this") → a UI blueprint the agent replicates in code.
+  // FILE TEXT (PDF/code/text) is carried SEPARATELY as ctx.fileText — never appended to the task
+  // string: every agent prompt slices the task short (1.2K-4.5K), so an appended PDF was silently
+  // cut off and the agent never really read it. ctx.fileText is injected as its own source block
+  // into planning + every content step (same full-read behaviour as normal Firas AI chat), and is
+  // collected from EVERY user turn (like normal chat, which re-sends each turn's fileText) — so a
+  // file attached before clarify answers, or earlier in the mission, is never lost.
+  {
+    let allFiles = "";
+    for (const m of chat.messages) {
+      if (m.role === "user" && m.fileText) allFiles += (allFiles ? "\n\n" : "") + String(m.fileText);
+    }
+    if (allFiles) ctx.fileText = allFiles.length > MAX_TOTAL_FILE_CHARS ? allFiles.slice(-MAX_TOTAL_FILE_CHARS) : allFiles;
+  }
   if (!resumeRun && lastUser && !prevAsk) {
     const att = Array.isArray(lastUser.images) ? lastUser.images : null;
-    const fileTxt = lastUser.fileText ? String(lastUser.fileText) : "";
-    if ((att && att.length) || fileTxt) {
+    if ((att && att.length) || lastUser.fileText) {
       aiMsg.content = serializeAgentRun({ task, title: "", phase: "read", lang: replyLang, steps: [], final: "", mode: "answer" });
       if (activeChat() === chat) renderThread(chat);
-      if (fileTxt) task += "\n\n=== محتوى ملف مرفق (مصدر — ابنِ المطلوب منه) / ATTACHED FILE CONTENT (source — build from it) ===\n" + fileTxt.slice(0, 60000);
       if (att && att.length && !controller.signal.aborted) {
         const wantsBuild = /موقع|صفحة|واجهة|تطبيق|مثل\s*(هذا|هذه|الصورة)|نفس\s*(التصميم|الشكل)|أعِد\s*بناء|اعد\s*بناء|صمّ?م|clone|like\s*(this|the\s*image)|rebuild|recreate|website|landing|\bpage\b|\bapp\b|\bui\b|design|screenshot/i.test(task);
         let vis = "";
@@ -11282,8 +11301,10 @@ async function runAgentAssistant(chat, tier, replyLang, resumeRun) {
     if (persist) { chat.updatedAt = Date.now(); persistChat(chat); }
   };
   // ① CLARIFY FIRST — a fresh, ambiguous build/big task → ask 2-3 smart questions before executing.
+  // An attached file IS the spec — execute directly from it (normal Firas AI never quizzes a user
+  // who just uploaded the source material).
   const isFollowUp = !!(ctx.prevProj || ctx.prevCode || ctx.prevRunTitle);
-  if (!resumeRun && !isFollowUp && !alreadyAsked && agentClarifyNeeded(task)) {
+  if (!resumeRun && !isFollowUp && !alreadyAsked && !ctx.fileText && agentClarifyNeeded(task)) {
     aiMsg.content = serializeAgentRun({ task, title: "", phase: "plan", lang: replyLang, steps: [], final: "", mode: "answer" });
     if (activeChat() === chat) renderThread(chat);
     let askSpec = null;
