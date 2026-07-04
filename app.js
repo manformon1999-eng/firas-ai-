@@ -804,6 +804,27 @@ function requestedFormatForAssistant(chat, index) {
   return null;
 }
 
+/** Deliverable format for a message that CARRIES a ```firas-file meta block — the Firas Agent
+    delivers its documents this way. The block itself proves this IS a downloadable file, so it
+    always gets the file card + masked body (same as a normal Firas AI file reply) even when the
+    immediately preceding user message doesn't look like a file request (e.g. it's the answers
+    to the agent's clarifying questions, or a task phrasing detectFileRequest doesn't match).
+    Format = the nearest explicit format any earlier user message asked for, else pdf. */
+function fileMetaFormat(msg, chat) {
+  if (!msg || !msg.content || !/```firas-file/i.test(msg.content)) return null;
+  const c = chat || activeChat();
+  if (c && Array.isArray(c.messages)) {
+    const idx = c.messages.indexOf(msg);
+    for (let i = idx - 1; i >= 0; i--) {
+      const m = c.messages[i];
+      if (m.role !== "user") continue;
+      const fmt = detectFileRequest(m.content);
+      if (fmt) return fmt; // honour the user's explicit format choice
+    }
+  }
+  return "pdf";
+}
+
 /** Should this assistant message be MASKED as a streaming/finished FILE (loader +
     card + collapsed disclosure instead of raw content)? True when the user
     requested a file format for this turn AND this turn actually delivers it —
@@ -818,6 +839,10 @@ function isFileStreamReply(msg, chat) {
   if (!c || !Array.isArray(c.messages)) return null;
   const index = c.messages.indexOf(msg);
   if (index < 0) return null;
+  // A ```firas-file meta block IS the delivered file (how the Agent ships its documents) —
+  // always mask + card it, exactly like a normal Firas AI file reply.
+  const metaFmt = fileMetaFormat(msg, c);
+  if (metaFmt) return metaFmt;
   const fmt = requestedFormatForAssistant(c, index);
   if (!fmt) return null;
   // In plan mode, mask only the EXECUTION reply (after the user approved); the
@@ -3754,7 +3779,9 @@ function aiTurnEl(msg, index) {
   // agent/deck card or a clarifying-questions turn — those carry their own UI (a stray file
   // card would export the block JSON as a "document").
   if (msg.content && msg.content.trim() && !msg.offline && !imgMeta && !codeMeta && !deckMeta && !agentMeta && !/^\s*```firas-(?!file)/.test(msg.content)) {
-    const fmt = requestedFormatForAssistant(activeChat(), index);
+    // A firas-file meta block always earns the card (the Agent's doc deliverables carry one),
+    // even when the preceding user message isn't an obvious file request (clarify answers…).
+    const fmt = fileMetaFormat(msg, activeChat()) || requestedFormatForAssistant(activeChat(), index);
     if (fmt) {
       const card = fileCardEl(msg, fmt);
       if (card) turn.appendChild(card);
