@@ -10006,16 +10006,25 @@ function isNativeApp() {
   const cap = window.Capacitor;
   return !!(cap && typeof cap.isNativePlatform === "function" && cap.isNativePlatform());
 }
-/** Get the native Google-auth plugin. On a REMOTE page the JS wrapper isn't imported, so
- *  Capacitor.Plugins.FirebaseAuthentication can be undefined — registerPlugin() builds the bridge proxy by name. */
-function nativeGoogleAuthPlugin() {
+/** Get the native Google-auth plugin handle. On a REMOTE page the JS wrapper isn't imported and
+ *  registerPlugin doesn't exist on the injected bridge; Capacitor injects Plugins.FirebaseAuthentication
+ *  itself, once per NATIVELY-registered plugin, at documentStart. Poll briefly for the injection race,
+ *  then fall back to the low-level nativePromise the proxy itself uses. */
+async function nativeGoogleAuthPlugin(timeoutMs) {
   const cap = window.Capacitor;
   if (!cap || !isNativeApp()) return null;
-  let p = (cap.Plugins && cap.Plugins.FirebaseAuthentication) || null;
-  if (!p && typeof cap.registerPlugin === "function") {
-    try { p = cap.registerPlugin("FirebaseAuthentication"); } catch (_) { p = null; }
+  const t0 = Date.now();
+  while (!(cap.Plugins && cap.Plugins.FirebaseAuthentication && cap.Plugins.FirebaseAuthentication.signInWithGoogle)) {
+    if (Date.now() - t0 > (timeoutMs || 4000)) break;
+    await new Promise((r) => setTimeout(r, 50));
   }
-  return p;
+  const P = cap.Plugins && cap.Plugins.FirebaseAuthentication;
+  if (P && P.signInWithGoogle) return P;
+  if (typeof cap.nativePromise === "function") {
+    // Same native code path the injected proxy uses; rejects "not implemented" if not registered natively.
+    return { signInWithGoogle: (o) => cap.nativePromise("FirebaseAuthentication", "signInWithGoogle", o || {}) };
+  }
+  return null;
 }
 async function handleGoogleSignIn() {
   if (!hasFirebaseConfig() || authEls.google.disabled) return;
@@ -10032,15 +10041,9 @@ async function handleGoogleSignIn() {
     // In a native shell we NEVER fall back to the popup/redirect — that path is exactly what Google blocks,
     // so a missing plugin surfaces a clear message instead of the confusing 403.
     if (isNativeApp()) {
-      const nativeAuth = nativeGoogleAuthPlugin();
+      const nativeAuth = await nativeGoogleAuthPlugin();
       if (!nativeAuth) {
-        let dbg;
-        try {
-          const c = window.Capacitor || {};
-          const keys = c.Plugins ? Object.keys(c.Plugins) : [];
-          dbg = "P:[" + keys.join(",") + "] reg:" + (typeof c.registerPlugin) + " plat:" + (c.getPlatform ? c.getPlatform() : "?");
-        } catch (e) { dbg = "err:" + (e && e.message); }
-        showAuthError("تشخيص — صوّر هذا وأرسله: " + dbg);
+        showAuthError("تعذّر تشغيل تسجيل جوجل داخل التطبيق. حدّث التطبيق إلى أحدث نسخة وأعد فتحه.");
         return;
       }
       const native = await nativeAuth.signInWithGoogle();
