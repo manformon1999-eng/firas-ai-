@@ -10014,17 +10014,14 @@ async function nativeGoogleAuthPlugin(timeoutMs) {
   const cap = window.Capacitor;
   if (!cap || !isNativeApp()) return null;
   const t0 = Date.now();
+  // Capacitor injects Plugins.FirebaseAuthentication only for a NATIVELY-registered plugin, at
+  // documentStart; poll briefly for the injection race.
   while (!(cap.Plugins && cap.Plugins.FirebaseAuthentication && cap.Plugins.FirebaseAuthentication.signInWithGoogle)) {
     if (Date.now() - t0 > (timeoutMs || 4000)) break;
     await new Promise((r) => setTimeout(r, 50));
   }
   const P = cap.Plugins && cap.Plugins.FirebaseAuthentication;
-  if (P && P.signInWithGoogle) return P;
-  if (typeof cap.nativePromise === "function") {
-    // Same native code path the injected proxy uses; rejects "not implemented" if not registered natively.
-    return { signInWithGoogle: (o) => cap.nativePromise("FirebaseAuthentication", "signInWithGoogle", o || {}) };
-  }
-  return null;
+  return (P && P.signInWithGoogle) ? P : null;
 }
 async function handleGoogleSignIn() {
   if (!hasFirebaseConfig() || authEls.google.disabled) return;
@@ -10043,7 +10040,9 @@ async function handleGoogleSignIn() {
     if (isNativeApp()) {
       const nativeAuth = await nativeGoogleAuthPlugin();
       if (!nativeAuth) {
-        showAuthError("تعذّر تشغيل تسجيل جوجل داخل التطبيق. حدّث التطبيق إلى أحدث نسخة وأعد فتحه.");
+        let keys = "?";
+        try { keys = Object.keys((window.Capacitor && window.Capacitor.Plugins) || {}).join(","); } catch (e) {}
+        showAuthError("لم تُسجَّل إضافة جوجل بعد. صوّر وأرسل: [" + keys + "]");
         return;
       }
       const native = await nativeAuth.signInWithGoogle();
