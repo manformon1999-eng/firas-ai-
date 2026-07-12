@@ -592,7 +592,7 @@ function detectLang(text) {
    Arabic + English. Checks pptx/xlsx/docx BEFORE the generic pdf fallback.
 ---------------------------------------------------------------------------- */
 const FILE_REQUEST_VERBS =
-  /\b(make|create|generate|build|produce|export|give\s*me|turn\s*(?:it|this)?\s*into|convert|save|download|send\s*me|write(?:\s*me)?|draft|compose|author|prepare|put\s*(?:it|this)?\s*(?:in|into))\b|اصنع|إصنع|أنشئ|انشئ|سوّ?ي|اعمل|إعمل|اعملي|حوّ?ل|صدّ?ر|أعطني|اعطني|نزّ?ل|ابعت|إبعت|جهّ?ز|اكتب(?:\s*لي)?|خرّ?ج/i;
+  /\b(make|create|generate|build|produce|export|give\s*me|turn\s*(?:it|this)?\s*into|convert|save|download|send\s*me|write(?:\s*me)?|draft|compose|author|prepare|put\s*(?:it|this)?\s*(?:in|into))\b|اصنع|إصنع|أنشئ|انشئ|سوّ?ي|اعمل|إعمل|اعملي|حوّ?ل|صدّ?ر|أعطني|اعطني|نزّ?ل|ابعت|إبعت|جهّ?ز|اكتب(?:\s*لي)?|خرّ?ج|طلّ?علي|طلّ?ع\s*لي|دزّ?\s*لي|دزلي|طبعلي|طبع\s*لي|جيب\s*لي|جبلي/i;
 
 /* ----------------------------------------------------------------------------
    CODE requests — "make me a single-file HTML site", "اكتب لي كود", "vanilla JS
@@ -741,7 +741,7 @@ function detectFileRequest(text) {
       // "ورد" alone also means roses / "was mentioned" (ما ورد) — only treat it as
       // Word when a document cue precedes it; "وورد"/word/docx stay unambiguous.
       strong: /docx|مستند\s*word|مستند\s*وورد|وورد|(?:ملف|مستند|بصيغة|صيغة|بصبغة)\s*ورد/i,
-      weak:   /\bword\b/i },
+      weak:   /\bms\s*word\b|\bword\s+(?:doc|document|file|format)\b/i },
     { fmt: "pdf",
       strong: /\bpdf\b|بي\s*دي\s*اف|بدف|ملف\s*pdf/i,
       weak:   null },
@@ -772,8 +772,12 @@ function detectFileRequest(text) {
   //     document. Let the dedicated code path handle it (returns null here).
   if (detectCodeRequest(text)) return null;
   // 2) A common (weak) word counts only with a request verb or a generic file word.
+  //    First strip FIXED non-file compounds so "cheat/balance/spec sheet", "sheet music",
+  //    "microscope/glass/culture slides", "presentation letter" and "card/on deck" never
+  //    misfire as a spreadsheet or a deck (several of these already false-positive today).
+  const sWeak = s.replace(/microscope\s+slides?|glass\s+slides?|culture\s+slides?|presentation\s+letter|cheat\s+sheet|balance\s+sheet|spec\s+sheet|sheet\s+music|on\s+deck|card\s+deck/gi, " ");
   for (const f of formats) {
-    if (f.weak && f.weak.test(s) && (hasVerb || genericFileRe.test(s))) return f.fmt;
+    if (f.weak && f.weak.test(sWeak) && (hasVerb || genericFileRe.test(s))) return f.fmt;
   }
   // 3) A request verb + a generic "file/document" word OR a document-deliverable noun
   //    (report/book/summary/بحث/تقرير…) defaults to PDF — so most document requests
@@ -1528,7 +1532,12 @@ function renderMarkdown(text, opts) {
 
   // Shield math from markdown first, render after.
   const mathStore = [];
-  const src = protectMath(maskedSrc, mathStore);
+  let src = protectMath(maskedSrc, mathStore);
+  // Any leftover $ glued to a digit is currency, not math (genuine numeric-leading math like $5x+3$
+  // was already stashed above). Isolate each such $ in its own inline element so KaTeX auto-render —
+  // which re-scans the finished DOM independently of protectMath — cannot pair it with a later $ and
+  // turn "$5 for tea and $3" into rendered math. Inert, class-only markup; tolerated by html2canvas/Word.
+  src = src.replace(/\$(?=\d)/g, '<span class="cur-dollar">$</span>');
 
   let html;
   if (hasMarked) {
@@ -4806,7 +4815,7 @@ function exportCss(th, isAr, scope, tpl) {
     dp + ".cover__date{font-family:" + sansStack + ";font-size:11pt;color:rgba(255,255,255,.72)}" +
     dp + ".doc{padding-top:2mm}" +
     // Editorial lead: the opening paragraph reads slightly larger, like a professional report.
-    dp + ".doc>p:first-of-type{font-size:13.8pt;line-height:1.78;color:#" + ink + "}" +
+    dp + ".doc:not(.doc--cont)>p:first-of-type{font-size:13.8pt;line-height:1.78;color:#" + ink + "}" +
     dp + "h1," + dp + "h2," + dp + "h3," + dp + "h4{font-family:" + sansStack + ";color:#" + ink + ";line-height:1.3;font-weight:700;" + (isAr ? "letter-spacing:normal;word-spacing:.04em;" : "letter-spacing:-.01em;") + "page-break-after:avoid;break-after:avoid}" +
     dp + "h1{font-size:23.5pt;margin:.2em 0 .5em;padding-bottom:.24em;border-bottom:2.5px solid #" + th.accent + "}" +
     dp + "h2{font-size:17.5pt;margin:1.35em 0 .5em;color:#" + ink + ";padding-inline-start:.55em;border-inline-start:4.5px solid #" + th.accent + "}" +
@@ -4843,7 +4852,7 @@ function exportCss(th, isAr, scope, tpl) {
     dp + "p>img:only-child," + dp + "p>img:first-child{display:block;margin:1.1em auto .5em;max-width:88%;max-height:80mm;object-fit:cover;border-radius:10px;box-shadow:0 3px 14px " + rgba(th.deep, 0.22) + ";border:1px solid #" + line + "}" +
     dp + "p>img+em," + dp + "img+em{display:block;text-align:center;font-family:" + sansStack + ";font-size:9.5pt;color:#55534c;margin-top:.2em}" +
     // Editorial end ornament after the last section.
-    dp + ".doc::after{content:'❖';display:block;text-align:center;color:#" + th.accent + ";font-size:13pt;margin:2.2em 0 .5em;opacity:.85}" +
+    dp + ".doc:not(.doc--mid)::after{content:'❖';display:block;text-align:center;color:#" + th.accent + ";font-size:13pt;margin:2.2em 0 .5em;opacity:.85}" +
     dp + ".tikz-figure{margin:1.1em 0;text-align:center;page-break-inside:avoid;break-inside:avoid}" +
     dp + ".tikz-figure svg{max-width:100%;height:auto}" +
     dp + ".plot-figure{max-width:480px;margin-inline:auto}" +
@@ -4943,6 +4952,28 @@ function exportBody(mdNode, lang, meta) {
     "</div></section>"
   ) : "";
   return { cover, body, hasCover: !!title };
+}
+
+/** Build a Word-only Table of Contents from the document's headings (level-indented
+    outline). Gives the .docx a proper "Contents" page; skipped for short single-section
+    docs. Styles are inlined so html-docx-js keeps them and the app's .doc CSS never leaks in. */
+function buildDocToc(mdNode, isAr, th) {
+  const hs = Array.from(mdNode.querySelectorAll("h1, h2, h3"))
+    .map((h) => ({ lvl: +h.tagName.slice(1), text: (h.textContent || "").replace(/\s+/g, " ").trim() }))
+    .filter((h) => h.text);
+  // Only worthwhile once the document is genuinely multi-section.
+  if (hs.filter((h) => h.lvl <= 2).length < 3) return "";
+  const rows = hs.map((h) => {
+    const pad = (h.lvl - 1) * 20;
+    const w = h.lvl === 1 ? "700" : h.lvl === 2 ? "600" : "400";
+    const fs = h.lvl === 1 ? "12.5pt" : h.lvl === 2 ? "11.5pt" : "10.5pt";
+    return "<div style=\"margin:.3em 0;padding-inline-start:" + pad + "px;font-weight:" + w +
+      ";font-size:" + fs + ";color:#1a1a18\">" + escapeHtml(h.text) + "</div>";
+  }).join("");
+  return "<section style=\"page-break-after:always;break-after:page;padding-top:3mm\">" +
+    "<h2 style=\"font-family:sans-serif;font-size:17.5pt;font-weight:700;color:#1a1a18;" +
+    "border-inline-start:4.5px solid #" + th.accent + ";padding-inline-start:.55em;margin:0 0 .9em\">" +
+    (isAr ? "المحتويات" : "Contents") + "</h2>" + rows + "</section>";
 }
 
 /** Full self-contained themed HTML document (used by Word / html-docx-js). */
@@ -5214,12 +5245,21 @@ async function exportPdf(turn, lang, msg, opts) {
     // file size sane. jpeg quality raised across the board.
     const baseScale = totalCssH > 120000 ? 2 : totalCssH > 40000 ? 2.5 : 3;
     const jpegQ = totalCssH > 120000 ? 0.82 : totalCssH > 40000 ? 0.9 : 0.97;
+    const preferPng = totalCssH <= 40000;   // short/medium docs: lossless PNG pages = crisp black text (JPEG fringes glyph edges); big books stay JPEG for sane file size
     const chunks = [];                              // each: { nodes:[...], scale }
     if (coverEl) chunks.push({ nodes: [coverEl], scale: baseScale, isCover: true });
     let cur = [], curH = 0;
     for (const b of blocks) {
       const h = Math.max(1, b.offsetHeight);
-      if (curH + h > CHUNK_CSS_MAX && cur.length) { chunks.push({ nodes: cur, scale: baseScale }); cur = []; curH = 0; }
+      if (curH + h > CHUNK_CSS_MAX && cur.length) {
+        // Never strand a heading at the FOOT of a chunk: carry any trailing heading(s) into the NEXT
+        // chunk so a section title always travels with the content it introduces (its real following
+        // block lives in the next chunk, so its nextElementSibling keep-zone at L5271 can't protect it).
+        const carry = [];
+        while (cur.length > 1 && /^H[1-4]$/.test(cur[cur.length - 1].tagName)) carry.unshift(cur.pop());
+        chunks.push({ nodes: cur, scale: baseScale });
+        cur = carry; curH = carry.reduce((s, n) => s + Math.max(1, n.offsetHeight), 0);
+      }
       cur.push(b); curH += h;
     }
     if (cur.length) chunks.push({ nodes: cur, scale: baseScale });
@@ -5242,9 +5282,27 @@ async function exportPdf(turn, lang, msg, opts) {
       cr.style.cssText = "position:fixed;left:-10000px;top:0;width:794px;background:#fff;z-index:-1;color-scheme:only light";
       const st = document.createElement("style"); st.textContent = styleTxt.replace(/#firasExportRoot/g, "#firasExportChunk"); cr.appendChild(st);
       if (ch.isCover) { cr.appendChild(ch.nodes[0]); }
-      else { const dd = document.createElement("div"); dd.className = "doc"; ch.nodes.forEach((n) => dd.appendChild(n)); cr.appendChild(dd); }
+      else {
+        const dd = document.createElement("div");
+        // Only the FIRST body chunk keeps the oversized editorial lead paragraph, and only the LAST
+        // chunk prints the closing ❖ ornament — a fresh .doc wrapper per chunk would otherwise repeat
+        // both at every chunk seam (giant paragraphs + stray diamonds scattered mid-document).
+        const firstBody = coverEl ? 1 : 0;
+        dd.className = "doc" + (ci > firstBody ? " doc--cont" : "") + (ci < chunks.length - 1 ? " doc--mid" : "");
+        ch.nodes.forEach((n) => dd.appendChild(n)); cr.appendChild(dd);
+      }
       document.body.appendChild(cr);
       await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 20)));
+      // Shrink any display equation wider than the ~794px content column so it FITS instead of being
+      // clipped at the export-root edge (root is overflow:hidden@794px; .katex-display is overflow:visible).
+      // font-size scaling (not transform) reflows the box height so the captured cssH stays correct.
+      cr.querySelectorAll(".katex-display>.katex").forEach((k) => {
+        const avail = (k.parentElement && k.parentElement.clientWidth) || 780, w = k.scrollWidth;
+        if (w > avail + 2) {
+          const cs = parseFloat(getComputedStyle(k).fontSize) || 17;
+          k.style.fontSize = Math.max(9, cs * ((avail - 2) / w)).toFixed(1) + "px";
+        }
+      });
       const cssH = cr.scrollHeight;
       const chScale = Math.min(ch.scale, 15600 / Math.max(cssH, 1));   // never exceed the ~16k canvas cap (headroom)
       const canvas = await H2C(cr, { scale: chScale, useCORS: true, backgroundColor: "#ffffff", logging: false, windowWidth: 820 });
@@ -5252,6 +5310,14 @@ async function exportPdf(turn, lang, msg, opts) {
       const pxPerMm = canvas.width / contentWmm;
       const rr = cr.getBoundingClientRect(), sc = canvas.height / Math.max(rr.height, 1);
       const pageFullPx = pageContentMm * pxPerMm;
+      // Representative PROSE line-height in CANVAS px, so a forced mid-paragraph cut can snap to a line
+      // boundary and never bisect a text line (half-glyphs at the foot of one page + top of the next).
+      const proseLh = (() => {
+        const pEl = cr.querySelector(".doc p, .doc li");
+        if (!pEl) return 0;
+        const lh = parseFloat(getComputedStyle(pEl).lineHeight);
+        return (isFinite(lh) && lh > 6) ? lh * sc : 0;   // css px → canvas px via the measured sc
+      })();
       const yTop = (el) => (el.getBoundingClientRect().top - rr.top) * sc;
       const yBot = (el) => (el.getBoundingClientRect().bottom - rr.top) * sc;
       const breaks = [];
@@ -5264,7 +5330,7 @@ async function exportPdf(turn, lang, msg, opts) {
       // code, quotes, list items, tables. Plus "keep a heading with the block that follows it".
       // Only blocks that CAN fit on one page are protected; anything taller is allowed to break.
       const zones = [];
-      cr.querySelectorAll(".katex-display,figure,.plot-figure,.tikz-figure,img,pre,blockquote,li,table").forEach((el) => {
+      cr.querySelectorAll(".katex-display,figure,.plot-figure,.tikz-figure,img,pre,blockquote,li,table,tr").forEach((el) => {
         const t = yTop(el), b = yBot(el);
         if (b - t > 4 && b - t <= pageFullPx * 0.98) zones.push([t, b]);
       });
@@ -6644,14 +6710,14 @@ const STEM_HARD_RULE =
   "Make each exam varied (no two problems test the same single idea) and exam-worthy — while staying VALID, " +
   "well-posed and cleanly solvable with exact answers (solve each one yourself PRIVATELY first — the reader sees " +
   "only a finished, correct problem and its clean solution, never a broken attempt or a mid-solution correction; " +
-  "discard anything you cannot solve cleanly).";
+  "discard anything you cannot solve cleanly). ANSWER-KEY CORRECTNESS — verify every published final answer by an INDEPENDENT check (back-substitution, a units/dimensional check, or a limiting/special case) before writing it; a hard problem shipped with a wrong answer key is a FAILURE, so if an answer will not verify cleanly replace the problem with one whose answer does.";
 
 const SCIENCE_RIGOR =
   " PER-SUBJECT SCIENTIFIC RIGOR (applies the moment a question is physics, chemistry or biology; every tier, every engine; these are extra per-subject invariants the finished answer must satisfy — they add to, and never replace, the general math/science correctness rules)." +
   " PHYSICS — treat UNITS, DIMENSIONS and SIGNIFICANT FIGURES as part of the correct answer: name the governing law or principle first, derive the result SYMBOLICALLY, then substitute numbers with their units attached, carrying units through every line and cancelling them explicitly (a naked number is incomplete). The final expression's units MUST reduce to the units the quantity should have (a force to $\\text{kg}\\cdot\\text{m/s}^2=\\text{N}$, an energy to $\\text{J}$) — treat this dimensional check as a required gate the answer passes before you write it. Prefer SI, converting first unless the user requests other units. Report the numeric answer to the correct SIGNIFICANT FIGURES — no more precision than the least-precise given value (for $+$/$-$ align by decimal place, for $\\times$/$\\div$ keep the fewest significant figures), carry one guard digit through intermediate steps, round only at the end, and always attach the unit inside \\text{} (e.g. $9.8\\,\\text{m/s}^2$). State the assumptions and regime explicitly (frictionless, ideal gas, small-angle, non-relativistic…), and close with a one-line physical-plausibility note (right order of magnitude, correct sign or direction, sensible limiting cases)." +
   " CHEMISTRY — BALANCE, STOICHIOMETRY and SIGNIFICANT DIGITS: write every reaction as a BALANCED equation whose atom counts for each element match on both sides, and whose net charge matches on both sides for ionic or redox equations (balance electrons via half-reactions); an equation only appears once it is balanced. Include the correct physical states $(s,l,g,aq)$ and correct formulae, charges and oxidation states. Use mhchem $\\ce{...}$ for species and reactions (e.g. $\\ce{2H2 + O2 -> 2H2O}$) and $\\pu{...}$ for physical quantities. For any quantitative problem work through MOLES explicitly (mass → moles via molar mass → mole ratio from the balanced coefficients → target), identify the LIMITING REAGENT before computing a yield, keep units ($\\text{mol}$, $\\text{g}$, $\\text{mol/L}$) on every quantity, and give the final answer to the correct significant figures with its unit. For a mechanism, describe electron flow (nucleophile toward electrophile), name each intermediate and the rate-determining step, and account for every step rather than skipping one." +
   " BIOLOGY — PRECISE MECHANISM and TERMINOLOGY: use exact, correct scientific terms (name the specific molecules, enzymes, organelles, cell types, phases, pathways, ion channels or taxa) and never a vague paraphrase where a precise term exists, and never conflate near terms (mitosis vs meiosis, transcription vs translation, allele vs gene, antigen vs antibody, artery vs vein). Present a mechanism as an ordered CAUSAL CHAIN — what binds, activates or inhibits what, in which direction, producing what result — not a loose list of facts, and state where in the cell or organism it happens and what regulates it. Respect directionality and quantitative facts exactly (transcription $5'\\to3'$; $\\text{DNA}\\to\\text{RNA}\\to\\text{protein}$; correct Punnett ratios; correct chromosome and base-pair counts), give correct units for any biological quantity, and distinguish an established mechanism from a hypothesis." +
-  " ACROSS ALL THREE: if the subject is ambiguous, infer it and apply that subject's rigor. (These are additional per-subject requirements; the general rule about verifying privately and presenting one clean solution already governs how you write — do not restate it.)";
+  " MATHEMATICS — DOMAIN, VALIDITY and EXTRANEOUS ROOTS: state the domain and validity conditions before manipulating (dividing by a possibly-zero quantity, squaring both sides, taking a log of a non-positive, or differentiating/integrating across a discontinuity), substitute every candidate solution back into the ORIGINAL equation and DISCARD extraneous roots, verify convergence before summing a series or exchanging a limit and an integral, and keep exact closed forms (fractions, radicals, $\\pi$) unless a decimal is asked — an unchecked root or an ignored domain restriction is a WRONG answer. ACROSS ALL SUBJECTS (mathematics, physics, chemistry, biology…): if the subject is ambiguous, infer it and apply that subject's rigor. (These are additional per-subject requirements; the general rule about verifying privately and presenting one clean solution already governs how you write — do not restate it.)";
 
 // ---- BACKTRACK SCRUBBER (client net) — SHARED w/ server.mjs & netlify/edge-functions/api.js — keep BYTE-IDENTICAL ----
 // Whole-string mirror of the server's streaming scrubber: strips visible self-correction ('wait, that's wrong,
@@ -6720,6 +6786,7 @@ function buildMessages(tier, conversation, replyLang) {
     "subscripts/superscripts), and put units and words that appear inside math in \\text{} with thin spaces " +
     "(e.g. $9.8\\,\\text{m/s}^2$, $3\\,\\text{N}\\cdot\\text{m}$, chemical formulas like $\\text{H}_2\\text{O}$). " +
     "Never emit broken or glued commands (e.g. \\cdotp with no space) that would fail to render. " +
+    "Use $ … $ ONLY for mathematics: write money as a number plus its currency word (\"50 دولار\", \"USD 50\"), NEVER a bare \"$50\", and never leave a LaTeX command outside $ … $ — so a dollar sign in ordinary prose is never mistaken for a math delimiter. " +
     "MATH RIGOR: solve step by step, carry out every algebraic and arithmetic step exactly, and " +
     "VERIFY the result before giving it (e.g. differentiate an antiderivative back to the integrand, " +
     "substitute values to check an identity or equation, sanity-check limits and edge cases). Never " +
@@ -7039,10 +7106,18 @@ function plannerSys(fmt, lang) {
     "well-ordered structure — do NOT write the full content yet. Output FIRST this exact block (valid JSON):\n" +
     "```firas-file\n{\"filename\":\"short meaningful name in the user's language, no extension\",\"title\":\"a SHORT " +
     "clean title (max ~8 words); a formula goes ONCE as $ … $ LaTeX, never raw code/backslashes, never repeated\"," +
-    "\"subtitle\":\"one concise line or empty\",\"theme\":\"<one theme key>\"}\n```\nthen a blank line, " +
-    "then a concise OUTLINE (bullet list) of the sections/items in order — a professional flow (clear opening/intro, " +
-    "logically grouped main sections with descriptive headings, supporting tables/lists where useful, and a closing/" +
-    "summary). If the user asked for N items (e.g. N equations), plan exactly N. Pick a theme whose tone fits the topic." +
+    "\"subtitle\":\"one concise line or empty\",\"theme\":\"<one theme key>\",\"accent\":\"\",\"template\":\"\"}\n```\n" +
+    "ACCENT: if the user named a SPECIFIC colour/style (وردي، أزرق سماوي، ذهبي فخم، بألوان جامعتي #1E90FF…), set \"accent\" " +
+    "to the best matching 6-digit hex (NO #) so the whole design adapts; otherwise leave it empty. " +
+    "TEMPLATE (document LAYOUT identity): set \"template\" to EXACTLY one of — 'ministry' for an exam/امتحان/وزاري paper, " +
+    "'academic' for a بحث/thesis/university report, 'corporate' for a business/تقرير عمل report, 'magazine' for an " +
+    "article/مقال/editorial; leave \"\" for anything else. " +
+    "Then a blank line, then FIRST a single brief line exactly like " +
+    "'READER: <who it is for> · PURPOSE: <why> · DEPTH: <brief|standard|deep>' inferred from the request (this line steers " +
+    "the author's register, vocabulary and depth), then a concise OUTLINE (bullet list) of the sections/items in order — a " +
+    "professional flow (clear opening/intro, logically grouped main sections with descriptive headings, supporting " +
+    "tables/lists where useful, and a closing/summary). If the user asked for N items (e.g. N equations), plan exactly N. " +
+    "Pick a theme whose tone fits the topic." +
     AGENT_THEMES + " No preamble, no commentary." + agentBrand(lang);
 }
 function authorSys(fmt, lang) {
@@ -7059,7 +7134,8 @@ function authorSys(fmt, lang) {
     "symbol, a short formula, or a variable) INLINE with $ … $ WITHIN the sentence; do NOT break short expressions onto " +
     "their own line, and use DISPLAY $$ … $$ ONLY for a standalone, important, multi-part equation. Never leave a lone " +
     "period or bare punctuation on its own line after an equation. NEVER put math in a code block, NEVER use \\documentclass or " +
-    "\\begin{document}, and NEVER tell the user to compile or use Overleaf.";
+    "\\begin{document}, and NEVER tell the user to compile or use Overleaf." +
+    " CURRENCY & NO-BLEED: reserve $ … $ STRICTLY for mathematics — write money as a number plus its currency word (\"50 دولار\", \"USD 50\", \"€30\"), NEVER a bare \"$50\", so a dollar sign in prose is never mistaken for math; never leave a LaTeX command (\\alpha, \\to, \\frac …) OUTSIDE $ … $, and never emit raw LaTeX or \\begin{tikzpicture} as visible text — every formula must sit inside its delimiters so it renders.";
   const tikzDocRule = (fmt === "pdf")
     ? " FIGURES / GRAPHS — YOU MUST INCLUDE THE ACTUAL FIGURE (never just describe 'the figure above'): " +
       "For ANY function/curve GRAPH you MUST use a fenced ```plot block — NEVER tikz for graphs (tikz graphs break in the PDF; " +
@@ -7100,23 +7176,30 @@ function authorSys(fmt, lang) {
     "• ONE '# Deck Title' at the very top.\n" +
     "• Group slides under sections: a '## Section Name' line ALONE (no bullets under it) becomes a full-screen SECTION DIVIDER — use 2-4 of them to chapter the talk.\n" +
     "• Each real slide = '### Slide Title' + 3-5 SHORT, punchy bullets (max ~10 words each — headlines, never paragraphs).\n" +
+    "• Right after the title slide, include an AGENDA/overview '### ' slide that lists the deck's main sections as bullets; and just before the closing, include a recap '### ' slide of 3-5 key takeaways. Title both in the user's language.\n" +
     "• For any slide that benefits from a visual AND real image URLs were provided in the task, put ONE image on its own line as ![short alt](URL) right under the title — the layout auto-goes two-column. NEVER invent an image URL; only use provided ones.\n" +
     "• When a slide presents NUMBERS/statistics/comparisons, add ONE line: Chart: {\"type\":\"bar|line|doughnut\",\"title\":\"…\",\"labels\":[\"…\"],\"data\":[numbers]} — it becomes a real chart. Use plausible real values; 1-3 chart slides per deck; a slide has a chart OR an image, never both.\n" +
     "• Add presenter script to most slides as a line 'Notes: <what the speaker says — 1-2 sentences of real spoken delivery>' — this becomes the PowerPoint speaker notes, hidden from the audience.\n" +
-    "Aim for 8-16 content slides. Make the bullets genuinely insightful and specific, not filler. Only the content, no metadata block, no preamble." + mathRule + agentBrand(lang);
+    "Aim for 10-16 content slides (never a thin 4-slide deck). Make every bullet a complete, specific insight — a real fact, number, name or concrete example — never a vague one-word label or filler. Only the content, no metadata block, no preamble." + mathRule + agentBrand(lang);
   return "You are an elite document author and editor producing a POLISHED, PROFESSIONAL document. Following the plan, " +
-    "write the FULL, accurate, thorough CONTENT as clean Markdown: a strong '# Title', a brief engaging introduction, " +
+    "write the FULL, accurate, thorough CONTENT as clean Markdown: a strong '# Title', an introduction that states the " +
+    "document's purpose, scope and who it is for, " +
     "logical ##/### sections with descriptive headings, clear well-written paragraphs (real prose, not terse fragments), " +
-    "bulleted/numbered lists where they aid clarity, GitHub-style Markdown tables for any structured data, and blockquotes " +
-    "for key takeaways. Keep a confident professional tone with smooth flow between sections, and finish with a concise " +
-    "conclusion/summary when appropriate. Be complete and correct: if N items were requested, produce exactly N, each " +
+    "bulleted/numbered lists where they aid clarity, and PROFESSIONAL tables for any structured/comparative data — every " +
+    "table gets self-describing headers with the UNIT in the header (not repeated in each cell), plain aligned numbers in " +
+    "numeric cells, and a one-line *italic caption* naming the table right before or after it; and blockquotes " +
+    "for key takeaways. Keep a confident professional tone with smooth flow between sections. ADAPT TO THE READER — the FILE PLAN opens with a one-line brief naming the " +
+    "reader, purpose and depth (READER / PURPOSE / DEPTH); OBEY it, calibrating vocabulary, sentence length, worked-example " +
+    "detail and section depth to that EXACT audience (a child's booklet, a university thesis and an executive brief read very " +
+    "differently); if the brief is missing, infer the audience from the request. ALWAYS close with a SUBSTANTIVE conclusion " +
+    "that synthesizes the key findings — never a bare restatement. Be complete and correct: if N items were requested, produce exactly N, each " +
     "properly explained. COUNT COMPLIANCE (hard rule): when the request names a number of items (questions/problems/" +
     "integrals…), deliver EXACTLY that many — give each item its own numbered heading (e.g. '## المسألة 5' / '## Problem 5') " +
     "with EXPLICIT numbers 1..N that never restart, and COUNT your items before finishing; a document with fewer items " +
     "than requested is a FAILED task. SOLUTIONS INLINE (hard rule): when the request asks for solutions, put each item's " +
     "COMPLETE worked step-by-step solution IMMEDIATELY after that item (problem 1 → its solution → problem 2 → its " +
     "solution …, e.g. '**الحل:**' / '**Solution:**'), ending in an exact verified final answer — NEVER defer solutions " +
-    "to a separate section at the end." + STEM_HARD_RULE + SCIENCE_RIGOR + " ORGANIZATION — make it VERY tidy and easy to scan: a consistent heading hierarchy, related content " +
+    "to a separate section at the end." + " VERIFY BEFORE YOU WRITE (accuracy gate — the reader sees ONE clean correct answer): for EVERY numeric, algebraic or symbolic result in the document, re-derive it a SECOND independent way BEFORE you write it — back-substitute the solution into the original equation, differentiate an antiderivative back to the integrand, re-check units and dimensions, or test a limiting/special case; commit a value ONLY once both routes agree, and present each final answer exactly once (boxed as $\\boxed{…}$, or alone after 'الإجابة النهائية:' / 'Final answer:'). NEVER show a wrong first attempt, a crossed-out line, or ANY visible self-correction ('مهلا' / 'انتظر' / 'wait' / 'let me redo' …) — all checking is silent and private, and each solution reads clean from its first line to its last. DO NOT FABRICATE SCIENTIFIC DATA: never invent a specific statistic, physical constant, reaction/thermodynamic value, date, measurement or citation you are not confident of — give a correct standard value or state it qualitatively rather than manufacture a precise-looking but wrong figure." + STEM_HARD_RULE + SCIENCE_RIGOR + " DEPTH & COMPLETENESS — never shallow: develop each section with real substance (well-developed paragraphs and/or a full worked list or table, not one thin line), use a clean NESTED heading hierarchy (## for main sections, ### for their sub-parts) without skipping levels, and make sure the document has a genuine introduction, at least three substantive body sections, and a real closing — a bullet-only skeleton is a FAILED document. ORGANIZATION — make it VERY tidy and easy to scan: a consistent heading hierarchy, related content " +
     "grouped together, uniform spacing (NO orphan lines, NO stray punctuation on its own line), and — for an exam/worksheet — " +
     "clean question numbering with its parts (A/B/C…) and marks, each figure placed right beside the item it belongs to. " +
     "IMAGES: when the task provides REAL IMAGE URLS, embed EACH one at a contextually fitting spot as ![short description](URL) " +
@@ -7575,6 +7658,13 @@ function sanitizeBareLatex(md) {
     s = s.replace(/\\times(?![a-zA-Z])/g, "×");
     s = s.replace(/\\(?:degree|textdegree)(?![a-zA-Z])/g, "°");
     s = s.replace(/\\pm(?![a-zA-Z])/g, "±");
+    // Any OTHER recognized bare LaTeX macro the model wrote OUTSIDE $…$ (it forgets delimiters, esp. in
+    // Arabic prose: \alpha, \to, \infty, \leq, \Rightarrow …) → wrap it in $…$ so KaTeX renders it
+    // instead of leaking literal backslash text to chat AND to generated PDF/Word (both call this fn).
+    // Runs ONLY on these even, non-math / non-fenced segments; the new $…$ is then protected by
+    // protectMath downstream. (?![a-zA-Z]) keeps longer commands (\left, \int, \leftarrow) intact;
+    // \cdot/\times/\degree/\pm are excluded since they were already unicode-ized above. "$$$&$$" → $\macro$.
+    s = s.replace(/\\(?:alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|iota|kappa|lambda|mu|nu|xi|rho|varrho|sigma|tau|upsilon|phi|varphi|chi|psi|omega|Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega|to|gets|infty|approx|neq|leq|geq|le|ge|ll|gg|in|notin|ni|subset|subseteq|supset|supseteq|cup|cap|emptyset|forall|exists|nexists|nabla|partial|sum|prod|int|oint|equiv|cong|sim|simeq|propto|perp|parallel|angle|Rightarrow|Leftarrow|Leftrightarrow|rightarrow|leftarrow|leftrightarrow|mapsto|mp|div|ast|star|circ|bullet|oplus|otimes|wedge|vee)(?![a-zA-Z])/g, "$$$&$$");
     return s;
   }).join("");
 }
@@ -7675,7 +7765,7 @@ async function ensureDocItemCount(doc, requested, reqText, sysContent, call, sig
           "\n\nTHE DOCUMENT SO FAR (its ending is shown — match its language, heading style, numbering and difficulty EXACTLY):\n…" + doc.slice(-6000) +
           "\n\nINCOMPLETE: the user asked for " + requested + " items but the document contains ONLY " + have + ". " +
           "CONTINUE the document with the MISSING items — numbers " + (have + 1) + " through " + requested + " — same format, same numbering scheme continued (never restart at 1), same language. " +
-          (wantsSol ? "The user asked for SOLUTIONS: include the COMPLETE worked step-by-step solution immediately after EACH new item, ending in an exact verified final answer. " : "") +
+          (wantsSol ? "The user asked for SOLUTIONS: include the COMPLETE worked step-by-step solution immediately after EACH new item, ending in an exact final answer you VERIFIED a second independent way (back-substitution / differentiate the antiderivative / a units check) — present one clean correct solution with no visible self-correction. " : "") +
           "Output ONLY the new items: no title, no introduction, no conclusion, no repetition of existing items, no commentary." },
       ])) || "";
     } catch (e) { if (signal && signal.aborted) throw e; break; }
